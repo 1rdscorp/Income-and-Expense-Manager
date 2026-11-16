@@ -60,9 +60,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force deploy | Out-Null
           Copy-Item build\Release\Ledgerly.exe deploy\
-          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import deploy\Ledgerly.exe
+          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import --no-compiler-runtime deploy\Ledgerly.exe
           # App-local Visual C++ runtime, so no separate redistributable install is needed
           Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT\*.dll" deploy\
+          # Only SQLite is used; drop other database drivers and any redistributable installer
+          Get-ChildItem deploy\sqldrivers -Exclude qsqlite.dll | Remove-Item -Force
+          Remove-Item deploy\vc_redist*.exe -Force -ErrorAction SilentlyContinue
           Get-ChildItem deploy -Recurse -File | Measure-Object -Property Length -Sum | ForEach-Object { "{0} files, {1:N1} MB" -f $_.Count, ($_.Sum / 1MB) }
 
       - name: Smoke test the bundled app
