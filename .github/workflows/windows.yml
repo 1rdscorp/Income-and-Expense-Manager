@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Publish a GitHub Release with this new tag (e.g. v1.0.0). Leave empty for a normal build.'
+        required: false
+        default: ''
 
 permissions:
   contents: write # needed only to attach installers to a GitHub Release on v* tags
@@ -35,7 +40,10 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          if ("${{ github.ref }}" -like "refs/tags/v*") {
+          $tag = "${{ github.event.inputs.release_tag }}"
+          if ($tag -ne "") {
+            $v = $tag.TrimStart('v')
+          } elseif ("${{ github.ref }}" -like "refs/tags/v*") {
             $v = "${{ github.ref_name }}".TrimStart('v')
           } else {
             $m = Select-String -Path CMakeLists.txt -Pattern 'VERSION (\d+\.\d+\.\d+)' | Select-Object -First 1
@@ -108,8 +116,16 @@ jobs:
           path: dist/*
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          # On a manual run this creates the tag on the built commit
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: Ledgerly ${{ steps.ver.outputs.version }}
           files: dist/*
           generate_release_notes: true
+          body: |
+            **Download `Ledgerly-Setup-${{ steps.ver.outputs.version }}.exe`** below and run it to install Ledgerly on Windows 10/11 (64-bit). No administrator rights needed.
+            Windows SmartScreen may warn about an unknown publisher (the installer isn't code-signed): click **More info → Run anyway**.
+            Prefer not to install? Use the portable `.zip`: unzip anywhere and run `Ledgerly.exe`.
