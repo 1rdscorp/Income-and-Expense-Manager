@@ -1,0 +1,112 @@
+name: Windows installer
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed only to attach installers to a GitHub Release on v* tags
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Determine version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $v = "${{ github.ref_name }}".TrimStart('v')
+          } else {
+            $m = Select-String -Path CMakeLists.txt -Pattern 'VERSION (\d+\.\d+\.\d+)' | Select-Object -First 1
+            $v = $m.Matches[0].Groups[1].Value
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $v"
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Bundle Qt and the C++ runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force deploy | Out-Null
+          Copy-Item build\Release\Ledgerly.exe deploy\
+          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-quick-import deploy\Ledgerly.exe
+          # App-local Visual C++ runtime, so no separate redistributable install is needed
+          Copy-Item "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT\*.dll" deploy\
+          Get-ChildItem deploy -Recurse -File | Measure-Object -Property Length -Sum | ForEach-Object { "{0} files, {1:N1} MB" -f $_.Count, ($_.Sum / 1MB) }
+
+      - name: Smoke test the bundled app
+        shell: pwsh
+        run: |
+          # Run without the Qt SDK on PATH to prove the bundle is self-contained
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $data = Join-Path $env:RUNNER_TEMP "ledgerly-data"
+          $shots = Join-Path $env:RUNNER_TEMP "ledgerly-shots"
+          $p = Start-Process -FilePath deploy\Ledgerly.exe -ArgumentList "--data-dir", "`"$data`"", "--screenshots", "`"$shots`"" -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "Ledgerly did not exit in time" }
+          if ($p.ExitCode -ne 0) { throw "Ledgerly exited with code $($p.ExitCode)" }
+          $n = (Get-ChildItem $shots -Filter *.png).Count
+          if ($n -ne 6) { throw "Expected 6 screenshots, got $n" }
+          if (-not (Test-Path (Join-Path $data "ledgerly.db"))) { throw "Database was not created" }
+          Write-Host "Smoke test OK: $n pages rendered"
+
+      - name: Upload smoke-test screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-screenshots
+          path: ${{ runner.temp }}/ledgerly-shots/*.png
+          retention-days: 7
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" "/DSourceDir=$PWD\deploy" "/DOutputDir=$PWD\dist" installer\ledgerly.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Compress-Archive -Path deploy\* -DestinationPath "dist\Ledgerly-${{ steps.ver.outputs.version }}-portable.zip"
+          Get-ChildItem dist
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ledgerly-Windows-${{ steps.ver.outputs.version }}
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

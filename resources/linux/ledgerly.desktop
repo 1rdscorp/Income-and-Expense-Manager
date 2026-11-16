@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ledgerly
+GenericName=Income & Expense Manager
+Comment=Track small-business income, expenses and receipts
+Exec=Ledgerly
+Icon=ledgerly
+Terminal=false
+Categories=Office;Finance;

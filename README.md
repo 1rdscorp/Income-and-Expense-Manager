@@ -1,45 +1,79 @@
 # Ledgerly: Income & Expense Manager
 
-An offline-first income and expense manager for small businesses. It needs no server, no install and no account. Everything is stored in your browser on your device.
+A Windows desktop app for small businesses to record daily income and expenses, attach receipts, and see monthly and yearly totals. It is written in C++17 with Qt 6. All data stays on your computer in a local SQLite database.
 
-## Getting started
+## Install on Windows
 
-Open `index.html` in any modern browser (Chrome, Edge, Firefox or Safari). You can double-click the file.
+1. Open the repository's **Actions** tab on GitHub, then open the latest **Windows installer** run that finished successfully.
+2. Under **Artifacts**, download **Ledgerly-Windows-…**. Unzip it and run **`Ledgerly-Setup-x.y.z.exe`**.
+   - You don't need administrator rights. Setup offers to install just for you.
+   - It adds a Start-menu entry, an optional desktop shortcut and an uninstaller (*Settings → Apps*).
+   - Windows SmartScreen may warn that the app is from an unknown publisher, because the installer isn't code-signed. Click **More info → Run anyway**.
+3. If you'd rather not install anything, use the **portable `.zip`** from the same download. Unzip it anywhere and run `Ledgerly.exe`.
 
-To use it on several devices, or to install it as an app, host the folder on any static web server, for example:
+**Making a permanent download link.** To publish a release, push a version tag, for example `git tag v1.0.0 && git push origin v1.0.0`. The workflow then attaches the installer to a GitHub Release.
 
-```bash
-python3 -m http.server 8080
-```
-
-Then open http://localhost:8080.
-
-> **Tip:** Press **N** anywhere to add a new transaction.
+Requires Windows 10 or 11 (64-bit).
 
 ## Features
 
 | Area | What you can do |
 |---|---|
-| **Dashboard** | See today's spending, this month's income, expenses and net profit (compared with last month), and year-to-date profit. It also shows a monthly income vs. expenses chart (click a month to drill in), your top spending categories with budget progress, recent transactions and the last 7 days. |
-| **Transactions** | Add income or expenses for any day, with an amount, category, description, vendor or customer, payment method and notes. Attach **receipts**: images or PDFs, uploaded, dragged and dropped, or taken with your phone camera. The list is grouped by day with daily totals. You can filter by month, year or all time, by type and by category, search the text, and export to CSV. |
-| **Categories** | Comes with 28 standard business categories (7 income, 21 expense). You can add, rename, change the icon of, or delete a category, and set an optional monthly budget on expense categories. If you delete a category that is in use, you choose whether to move its transactions to another category or delete them. |
-| **Reports** | **Monthly:** totals, income and expenses by category (with % share and budget), and a daily breakdown. **Annual:** a category × month table with totals and net profit, plus a chart. **Year over year:** totals, changes, margin and the largest expense category. Every report can be exported to CSV or printed / saved as PDF. |
-| **Backup & Restore** | Download a full JSON backup that includes your receipt files, or a lighter backup without them. Export all transactions to CSV. You can restore by **replacing** all data or by **merging**, which adds only what's missing. A reminder appears if you haven't backed up recently. |
-| **Settings** | Set your business name and currency (24 options), choose light, dark or system theme, turn photo receipt compression on or off, and choose how often the backup reminder appears. You can also check storage usage, request persistent storage, restore the default categories, load sample data or erase all data. |
+| **Dashboard** | See today's spending, this month's income, expenses and net profit (compared with last month), and year-to-date profit. It also shows an interactive income-vs-expenses chart (click a month to drill in), your top spending categories with budget progress, recent transactions and the last 7 days. |
+| **Transactions** | Record income or expenses for any day: amount, category, description, vendor or customer (auto-completed), payment method and notes. Attach receipts with a file picker or drag and drop. Large phone photos are shrunk automatically. Transactions are grouped by day with daily totals. You can filter by month, year or all time, by type and by category, and search the text. Right-click to edit, duplicate for today, view receipts or delete (several at once is supported). You can also export to CSV. |
+| **Categories** | Comes with 28 standard business categories (7 income, 21 expense). You can add, edit or delete categories, choose an icon, and set an optional monthly budget with over-budget warnings. If you delete a category that is in use, you choose whether to move its transactions to another category or delete them. |
+| **Reports** | **Monthly:** income and expenses by category with % share and budget, plus a daily breakdown. **Annual:** a category × month table with totals and net profit. **Year over year:** totals and the change from the previous year. Every report can be exported to CSV, saved as PDF or printed. |
+| **Backup & Restore** | Save a full backup as one `.json` file that includes your receipts, or a lighter backup without them. You can also turn on **automatic backups** when the app closes, saved to a folder you choose (a OneDrive or Dropbox folder works well) and keeping the last *N* copies. Restore by replacing all data, or by merging, which adds only what's missing. A reminder appears if you haven't backed up recently. |
+| **Settings** | Set your business name and currency (24 options), choose light, dark or system theme, turn photo compression on or off, and choose how often the backup reminder appears. You can also open the data folder, restore the default categories, load sample data or erase all data. |
 
-## Data & privacy
+**Keyboard shortcuts:**
+- **Ctrl+N:** new transaction
+- **Ctrl+B:** back up now
+- **Ctrl+1 … Ctrl+6:** switch pages
+- **Del:** delete the selected transactions
+- **Ctrl+Enter:** save in the transaction dialog
 
-- Data is kept in the browser's IndexedDB. It never leaves the device unless you export a backup or a CSV.
-- Clearing your browser's site data will erase it, so **make regular backups**. The app reminds you to.
-- Amounts are stored as whole cents to avoid rounding errors.
+### Where your data lives
 
-## Project structure
+Your data is stored in `%APPDATA%\Ledgerly\ledgerly.db`. Use **Help → Open data folder** to open it. Uninstalling the app does **not** delete your data. Backups use the same format as the earlier Ledgerly web version, so you can import a backup made in the browser with **Backup & Restore → Restore → Merge**.
+
+## Building from source
+
+Requirements: CMake 3.21 or newer, a C++17 compiler, and Qt 6.4 or newer with the *Widgets, Sql (SQLite), Svg* and *PrintSupport* modules.
+
+**Windows** (Visual Studio 2022 + Qt 6 for MSVC 64-bit):
+
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH=C:/Qt/6.7.3/msvc2019_64
+```
+
+```bash
+cmake --build build --config Release
+```
+
+```bash
+ctest --test-dir build -C Release --output-on-failure
+```
+
+To make the build runnable on another PC, run `windeployqt build\Release\Ledgerly.exe`. To build the installer, compile `installer\ledgerly.iss` with [Inno Setup 6](https://jrsoftware.org/isinfo.php). The GitHub Actions workflow in `.github/workflows/windows.yml` does all of this automatically.
+
+**Linux** (e.g. Ubuntu 24.04):
+
+```bash
+sudo apt install cmake ninja-build qt6-base-dev qt6-svg-dev libqt6sql6-sqlite
+```
+
+```bash
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/Ledgerly
+```
+
+## Project layout
 
 ```
-index.html            App shell
-css/styles.css        Styles (light/dark themes, responsive, print)
-js/db.js              IndexedDB storage layer
-js/defaults.js        Default categories, currencies, settings
-js/charts.js          Dependency-free SVG bar chart
-js/app.js             Views, routing, forms, reports, backup/restore
+src/core/      Data model, SQLite store, backup (JSON/CSV), report builders (no UI; unit-tested)
+src/ui/        Qt Widgets: main window, pages, dialogs, chart, theme
+src/main.cpp   Entry point (--data-dir <dir> to use a different data folder)
+resources/     Icons, Windows .ico/.rc, Linux .desktop
+installer/     Inno Setup script for the Windows installer
+tests/         Qt Test suites: core logic (tst_core) and UI flows (tst_ui)
 ```

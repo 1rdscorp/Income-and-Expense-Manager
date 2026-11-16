@@ -1,3 +1,9 @@
+build/
+build-*/
+deploy/
+dist/
+*.user
+CMakeLists.txt.user
 .DS_Store
-node_modules/
-*.log
+.vs/
+out/
