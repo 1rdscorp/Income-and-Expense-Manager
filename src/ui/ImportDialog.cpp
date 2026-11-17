@@ -193,7 +193,7 @@ void ImportDialog::chooseFile()
 {
     if (lastDir.isEmpty()) lastDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
     const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Choose a statement"), lastDir,
-                                                      QStringLiteral("Statements (*.ofx *.qfx *.qif *.csv *.txt);;All files (*)"));
+                                                      QStringLiteral("Statements (*.ofx *.qfx *.qbo *.qif *.csv *.txt);;All files (*)"));
     if (path.isEmpty()) return;
     lastDir = QFileInfo(path).absolutePath();
     loadFile(path);

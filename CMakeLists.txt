@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(Ledgerly
-    VERSION 1.3.0
+    VERSION 1.4.0
     DESCRIPTION "Income & Expense Manager for small businesses"
     HOMEPAGE_URL "https://github.com/1rdscorp/Income-and-Expense-Manager"
     LANGUAGES CXX)
@@ -13,7 +13,7 @@ set(CMAKE_AUTORCC ON)
 
 option(LEDGERLY_BUILD_TESTS "Build unit tests" ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets Sql Svg PrintSupport)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets Sql Svg PrintSupport Network)
 
 if(MSVC)
     # Source files contain UTF-8 (emoji icons, currency symbols).
@@ -35,9 +35,10 @@ add_library(ledgerly_core STATIC
     src/core/Xlsx.h src/core/Xlsx.cpp
     src/core/Sync.h src/core/Sync.cpp
     src/core/BankImport.h src/core/BankImport.cpp
+    src/core/SimpleFin.h src/core/SimpleFin.cpp
 )
 target_include_directories(ledgerly_core PUBLIC src)
-target_link_libraries(ledgerly_core PUBLIC Qt6::Core Qt6::Sql)
+target_link_libraries(ledgerly_core PUBLIC Qt6::Core Qt6::Sql Qt6::Network)
 target_compile_definitions(ledgerly_core PUBLIC LEDGERLY_VERSION="${PROJECT_VERSION}")
 
 # ---- Desktop UI library (shared by the app and UI tests) ----

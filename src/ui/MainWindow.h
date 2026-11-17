@@ -44,6 +44,7 @@ private:
     void openTransactionDialog(const QString &editId, bool duplicate);
     void runSync();
     void runAutoImport();
+    void runBankDownload();
 
     QListWidget *m_nav = nullptr;
     QStackedWidget *m_stack = nullptr;

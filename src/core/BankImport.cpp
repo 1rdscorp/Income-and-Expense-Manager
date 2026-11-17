@@ -527,7 +527,8 @@ ParseResult parseData(const QByteArray &data, const QString &fileName, const Csv
 {
     const QString ext = QFileInfo(fileName).suffix().toLower();
     const QByteArray head = data.left(2000).toUpper();
-    if (ext == QLatin1String("ofx") || ext == QLatin1String("qfx") || head.contains("OFXHEADER") || head.contains("<OFX>")) return parseOfx(data);
+    if (ext == QLatin1String("ofx") || ext == QLatin1String("qfx") || ext == QLatin1String("qbo") || head.contains("OFXHEADER") || head.contains("<OFX>"))
+        return parseOfx(data);
     if (ext == QLatin1String("qif") || head.startsWith("!TYPE")) return parseQif(data);
     return parseCsv(data, csv);
 }
@@ -730,7 +731,7 @@ QVector<AutoImportResult> runAutoImport(Store &store)
     for (const Account &acc : store.accounts()) {
         const QString dir = watchFolder(store, acc.id);
         if (dir.isEmpty() || !QDir(dir).exists()) continue;
-        const QStringList files = QDir(dir).entryList({QStringLiteral("*.ofx"), QStringLiteral("*.qfx"), QStringLiteral("*.qif"), QStringLiteral("*.csv")},
+        const QStringList files = QDir(dir).entryList({QStringLiteral("*.ofx"), QStringLiteral("*.qfx"), QStringLiteral("*.qbo"), QStringLiteral("*.qif"), QStringLiteral("*.csv")},
                                                       QDir::Files, QDir::Time | QDir::Reversed);
         for (const QString &name : files) {
             const QString path = QDir(dir).filePath(name);

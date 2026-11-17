@@ -7,6 +7,7 @@
 #include "BankPage.h"
 #include "core/BankImport.h"
 #include "core/Sync.h"
+#include "core/SimpleFin.h"
 #include "ReportsPage.h"
 #include "SettingsPage.h"
 #include "Theme.h"
@@ -215,6 +216,13 @@ MainWindow::MainWindow(QWidget *parent)
     importTimer->start();
     QTimer::singleShot(3000, this, &MainWindow::runAutoImport);
 
+    // Live bank connection: download every 6 hours while open (checked every 30 minutes)
+    auto *bankTimer = new QTimer(this);
+    bankTimer->setInterval(30 * 60 * 1000);
+    connect(bankTimer, &QTimer::timeout, this, &MainWindow::runBankDownload);
+    bankTimer->start();
+    QTimer::singleShot(8000, this, &MainWindow::runBankDownload);
+
     QSettings ws = windowSettings();
     if (!restoreGeometry(ws.value(QStringLiteral("geometry")).toByteArray())) resize(1320, 860);
 
@@ -357,6 +365,19 @@ void MainWindow::runSync()
     sync::syncNow(s);
     m_syncing = false;
     refreshChrome();
+}
+
+void MainWindow::runBankDownload()
+{
+    Store &s = Store::instance();
+    if (!simplefin::isConnected(s)) return;
+    const auto r = simplefin::download(s);
+    if (!r.ok) s.addNotice(QStringLiteral("Bank download failed: %1").arg(r.error));
+    else if (r.imported > 0)
+        s.addNotice(QStringLiteral("%1 new bank/card transaction%2 downloaded%3")
+                        .arg(r.imported)
+                        .arg(r.imported == 1 ? QString() : QStringLiteral("s"),
+                             r.skipped ? QStringLiteral(" (%1 skipped as possible duplicates)").arg(r.skipped) : QString()));
 }
 
 void MainWindow::runAutoImport()

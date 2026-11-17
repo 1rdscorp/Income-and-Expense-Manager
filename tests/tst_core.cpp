@@ -3,6 +3,7 @@
 #include "core/Defaults.h"
 #include "core/Recurrence.h"
 #include "core/Reports.h"
+#include "core/SimpleFin.h"
 #include "core/Store.h"
 #include "core/Sync.h"
 #include "core/Util.h"
@@ -10,8 +11,77 @@
 
 #include <QSqlDatabase>
 #include <QSqlQuery>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <memory>
+
+
+/* Minimal stand-in for SimpleFIN Bridge, used to test the client end to end. */
+class MockBridge : public QObject
+{
+public:
+    QTcpServer server;
+    int accountRequests = 0;
+    QString lastQuery;
+    MockBridge()
+    {
+        server.listen(QHostAddress::LocalHost);
+        QObject::connect(&server, &QTcpServer::newConnection, this, [this]() {
+            while (QTcpSocket *s = server.nextPendingConnection()) {
+                auto buf = std::make_shared<QByteArray>();
+                QObject::connect(s, &QTcpSocket::readyRead, s, [this, s, buf]() {
+                    buf->append(s->readAll());
+                    if (!buf->contains("\r\n\r\n")) return;
+                    handle(s, *buf);
+                });
+            }
+        });
+    }
+    QString base() const { return QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()); }
+    QString token(const QString &name) const { return QString::fromLatin1((base() + QStringLiteral("/claim/") + name).toUtf8().toBase64()); }
+
+private:
+    void reply(QTcpSocket *s, int status, const QByteArray &body)
+    {
+        s->write("HTTP/1.1 " + QByteArray::number(status) + " X\r\nContent-Type: application/json\r\nContent-Length: " +
+                 QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+        s->disconnectFromHost();
+    }
+    void handle(QTcpSocket *s, const QByteArray &req)
+    {
+        const QList<QByteArray> first = req.left(req.indexOf("\r\n")).split(' ');
+        const QByteArray method = first.value(0), target = first.value(1);
+        if (method == "POST" && target == "/claim/good") {
+            const QString access = QStringLiteral("http://demo:s3cret@127.0.0.1:%1/simplefin").arg(server.serverPort());
+            return reply(s, 200, access.toUtf8());
+        }
+        if (method == "POST") return reply(s, 403, "Forbidden");
+        if (method == "GET" && target.startsWith("/simplefin/accounts")) {
+            if (!req.contains("Authorization: Basic " + QByteArray("demo:s3cret").toBase64())) return reply(s, 403, "Forbidden");
+            ++accountRequests;
+            lastQuery = QString::fromUtf8(target.mid(target.indexOf('?') + 1));
+            const qint64 d1 = QDateTime(QDate::currentDate().addDays(-3), QTime(12, 0)).toSecsSinceEpoch();
+            const qint64 d2 = QDateTime(QDate::currentDate().addDays(-1), QTime(12, 0)).toSecsSinceEpoch();
+            const QByteArray body = QStringLiteral(
+                R"({"errors":["U.S. Bank: please re-check your connection soon"],"accounts":[
+                  {"org":{"name":"U.S. Bank","domain":"usbank.com"},"id":"ACT-1","name":"Business Checking","currency":"USD",
+                   "balance":"10234.10","available-balance":"10000.00","balance-date":%1,
+                   "transactions":[
+                     {"id":"T1","posted":%1,"amount":"-61.40","description":"SHELL OIL 57444"},
+                     {"id":"T2","posted":%2,"amount":"1850.00","description":"DEPOSIT","payee":"Greenfield Ltd"},
+                     {"id":"T3","posted":0,"amount":"-9.99","description":"PENDING THING","pending":true}]},
+                  {"org":{"name":"U.S. Bank"},"id":"ACT-2","name":"Business Visa Card","currency":"USD","balance":"-512.00",
+                   "balance-date":%2,"transactions":[{"id":"C1","posted":%2,"amount":"-12.00","description":"GOOGLE *WORKSPACE"}]}]})")
+                                         .arg(d1)
+                                         .arg(d2)
+                                         .toUtf8();
+            return reply(s, 200, body);
+        }
+        reply(s, 404, "Not found");
+    }
+};
 
 class CoreTest : public QObject
 {
@@ -617,6 +687,67 @@ private slots:
         QVERIFY(QFile::exists(watch.filePath(QStringLiteral("Imported/nov.csv"))));
         QCOMPARE(s.accountTransactionCount(accId), 2);
         QVERIFY(bank::runAutoImport(s).isEmpty()); // nothing left
+    }
+
+
+    void simpleFinProtocol()
+    {
+        // v2 shape: errlist + connections
+        simplefin::AccountSet set;
+        QString err;
+        QVERIFY(simplefin::parseAccountSet(R"({"errlist":[{"code":"con.auth","msg":"Reconnect U.S. Bank"}],"connections":[{"conn_id":"C9","name":"U.S. Bank"}],
+            "accounts":[{"id":"A","name":"Checking","conn_id":"C9","currency":"USD","balance":"5.00","transactions":[
+            {"id":"x","posted":1763200000,"amount":"-1.25","description":"Coffee"}]}]})", &set, &err));
+        QCOMPARE(set.errors, QStringList{QStringLiteral("Reconnect U.S. Bank")});
+        QCOMPARE(set.accounts.size(), 1);
+        QCOMPARE(set.accounts[0].org, QStringLiteral("U.S. Bank"));
+        QCOMPARE(set.accounts[0].lines[0].amount, -125);
+        QCOMPARE(set.accounts[0].lines[0].externalId, QStringLiteral("sfin:A:x"));
+        QVERIFY(!simplefin::parseAccountSet("<html>", &set, &err));
+
+        Store &s = store();
+        MockBridge bridge;
+        QString access;
+        QVERIFY(!simplefin::claim(QStringLiteral("not a token"), &access, &err));
+        QVERIFY(!simplefin::claim(bridge.token(QStringLiteral("used")), &access, &err));
+        QVERIFY(err.contains(QStringLiteral("already used")));
+
+        QVERIFY(!simplefin::isConnected(s));
+        QVERIFY2(simplefin::connect(s, bridge.token(QStringLiteral("good")), &err), qPrintable(err));
+        QVERIFY(simplefin::isConnected(s));
+        QCOMPARE(bridge.accountRequests, 1); // balances-only read to set up accounts
+        QVERIFY(bridge.lastQuery.contains(QStringLiteral("balances-only=1")));
+        const QStringList linked = simplefin::linkedAccountNames(s);
+        QCOMPARE(linked, (QStringList{QStringLiteral("U.S. Bank Business Checking"), QStringLiteral("U.S. Bank Business Visa Card")}));
+        QString checkingId, visaId;
+        for (const auto &a : s.accounts()) {
+            if (a.name == QLatin1String("U.S. Bank Business Checking")) checkingId = a.id;
+            if (a.name == QLatin1String("U.S. Bank Business Visa Card")) visaId = a.id;
+        }
+        QVERIFY(!s.account(checkingId)->isCard());
+        QVERIFY(s.account(visaId)->isCard());
+
+        simplefin::DownloadResult r = simplefin::download(s, true);
+        QVERIFY2(r.ok, qPrintable(r.error));
+        QCOMPARE(r.imported, 3); // pending one waits until it posts
+        QVERIFY(bridge.lastQuery.contains(QStringLiteral("start-date=")));
+        QCOMPARE(r.messages, QStringList{QStringLiteral("U.S. Bank: please re-check your connection soon")});
+        QCOMPARE(s.accountTransactionCount(checkingId), 2);
+        QCOMPARE(s.accountTransactionCount(visaId), 1);
+        bool sawDeposit = false;
+        for (const auto &t : s.transactions())
+            if (t.accountId == checkingId && t.type == TxType::Income && t.description == QLatin1String("Greenfield Ltd")) sawDeposit = true;
+        QVERIFY(sawDeposit);
+
+        const int requests = bridge.accountRequests;
+        r = simplefin::download(s); // within 6 hours: no request at all
+        QCOMPARE(bridge.accountRequests, requests);
+        r = simplefin::download(s, true); // forced: same transactions again are skipped
+        QCOMPARE(r.imported, 0);
+        QVERIFY(simplefin::lastDownload(s).isValid());
+
+        simplefin::disconnect(s);
+        QVERIFY(!simplefin::isConnected(s));
     }
 
     void sharedFolderSync()

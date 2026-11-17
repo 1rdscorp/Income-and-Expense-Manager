@@ -23,6 +23,12 @@ private:
     void addRule();
     void editRule(const QString &id);
     void deleteRule(const QString &id);
+    void connectBank();
+
+    class QLabel *m_liveStatus;
+    class QPushButton *m_liveConnect;
+    class QPushButton *m_liveDownload;
+    class QPushButton *m_liveDisconnect;
 
     QTableWidget *m_accounts;
     QTableWidget *m_rules;

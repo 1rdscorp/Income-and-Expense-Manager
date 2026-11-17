@@ -5,10 +5,17 @@
 #include "Theme.h"
 #include "Widgets.h"
 #include "core/BankImport.h"
+#include "core/SimpleFin.h"
 #include "core/Store.h"
 #include "core/Util.h"
 
+#include <QApplication>
+#include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
+#include <QPlainTextEdit>
+#include <QUrl>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -52,6 +59,46 @@ BankPage::BankPage(QWidget *parent)
     bar->addWidget(imp);
     root->addLayout(bar);
 
+    // Live connection (SimpleFIN Bridge)
+    auto *live = new Card(QStringLiteral("Automatic bank connection"), QStringLiteral("U.S. Bank and most U.S. banks & cards, via SimpleFIN Bridge"));
+    m_liveStatus = new QLabel;
+    m_liveStatus->setWordWrap(true);
+    m_liveStatus->setTextFormat(Qt::RichText);
+    live->body()->addWidget(m_liveStatus);
+    auto *lrow = new QHBoxLayout;
+    m_liveConnect = ui::button(QStringLiteral("Connect bank…"), QStringLiteral("link"), QStringLiteral("primary"));
+    m_liveDownload = ui::button(QStringLiteral("Download now"), QStringLiteral("refresh"));
+    m_liveDisconnect = ui::button(QStringLiteral("Disconnect"), QStringLiteral("x"), QStringLiteral("dangerText"));
+    lrow->addWidget(m_liveConnect);
+    lrow->addWidget(m_liveDownload);
+    lrow->addWidget(m_liveDisconnect);
+    lrow->addStretch(1);
+    live->body()->addLayout(lrow);
+    root->addWidget(live);
+    connect(m_liveConnect, &QPushButton::clicked, this, &BankPage::connectBank);
+    connect(m_liveDownload, &QPushButton::clicked, this, [this]() {
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const auto r = simplefin::download(Store::instance(), true);
+        QApplication::restoreOverrideCursor();
+        if (!r.ok) QMessageBox::warning(this, QStringLiteral("Bank connection"), r.error);
+        else
+            QMessageBox::information(this, QStringLiteral("Bank connection"),
+                                     QStringLiteral("%1 new transaction%2 imported.%3%4")
+                                         .arg(r.imported)
+                                         .arg(r.imported == 1 ? QString() : QStringLiteral("s"),
+                                              r.skipped ? QStringLiteral("\n%1 skipped as possible duplicates or by your rules.").arg(r.skipped) : QString(),
+                                              r.messages.isEmpty() ? QString() : QStringLiteral("\n\nMessage from your bank connection: ") + r.messages.join(QLatin1Char(' '))));
+        refresh();
+    });
+    connect(m_liveDisconnect, &QPushButton::clicked, this, [this]() {
+        if (QMessageBox::question(this, QStringLiteral("Disconnect bank"),
+                                  QStringLiteral("Stop downloading transactions automatically?\n\nTransactions already imported are kept. To fully revoke "
+                                                 "access, also delete the Ledgerly app connection on SimpleFIN Bridge.")) != QMessageBox::Yes)
+            return;
+        simplefin::disconnect(Store::instance());
+        refresh();
+    });
+
     // Accounts
     auto *accCard = new Card(QStringLiteral("Accounts & cards"));
     auto *addAcc = ui::button(QStringLiteral("Add"), QStringLiteral("plus"));
@@ -90,9 +137,8 @@ BankPage::BankPage(QWidget *parent)
     howText->setWordWrap(true);
     howText->setTextFormat(Qt::RichText);
     how->body()->addWidget(howText);
-    auto *live = ui::muted(QStringLiteral("Live bank connections (automatic downloads straight from the bank) need a third-party banking service "
-                                          "such as Plaid, SimpleFIN or GoCardless, which depends on your country and requires an account with them."));
-    how->body()->addWidget(live);
+    how->body()->addWidget(ui::muted(QStringLiteral("U.S. Bank: in online banking open the account → Download transactions → choose "
+                                                    "“Quicken (QFX)”, “QuickBooks (QBO)” or “Spreadsheet (CSV)”.")));
     root->addWidget(how);
     root->addStretch(1);
 
@@ -124,6 +170,25 @@ void BankPage::refresh()
 {
     const Store &s = Store::instance();
     const auto &th = Theme::c();
+    const bool live = simplefin::isConnected(s);
+    m_liveConnect->setVisible(!live);
+    m_liveDownload->setVisible(live);
+    m_liveDisconnect->setVisible(live);
+    if (!live) {
+        m_liveStatus->setText(QStringLiteral(
+            "Download new transactions from your bank and cards automatically — no files needed. Uses <b>SimpleFIN Bridge</b>, a "
+            "small paid service (about $15 a year, paid to them) that connects to most U.S. banks and card issuers. "
+            "Ledgerly only gets read-only access to transactions and never sees your bank password."));
+    } else {
+        const QDateTime last = simplefin::lastDownload(s);
+        const QString err = simplefin::lastError(s);
+        QString html = QStringLiteral("<b>Connected</b> · accounts: %1<br>").arg(simplefin::linkedAccountNames(s).join(QStringLiteral(", ")).toHtmlEscaped());
+        html += last.isValid() ? QStringLiteral("Last download %1 · new transactions are downloaded every 6 hours while Ledgerly is open.")
+                                     .arg(util::fmtDateTime(last.toString(Qt::ISODate)))
+                               : QStringLiteral("No download yet.");
+        if (!err.isEmpty()) html += QStringLiteral("<br>") + ui::colorSpan(err, th.badText, true);
+        m_liveStatus->setText(html);
+    }
     const auto &accounts = s.accounts();
     m_accounts->setRowCount(accounts.size());
     for (int i = 0; i < accounts.size(); ++i) {
@@ -238,4 +303,56 @@ void BankPage::deleteRule(const QString &id)
     if (id.isEmpty()) return;
     if (QMessageBox::question(this, QStringLiteral("Delete rule"), QStringLiteral("Delete this rule?")) == QMessageBox::Yes)
         Store::instance().deleteImportRule(id);
+}
+
+void BankPage::connectBank()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Connect your bank (SimpleFIN Bridge)"));
+    dlg.setMinimumWidth(600);
+    auto *l = new QVBoxLayout(&dlg);
+    auto *steps = new QLabel(QStringLiteral(
+        "<ol style='margin-left:-18px'>"
+        "<li>Open <a href='https://bridge.simplefin.org'>bridge.simplefin.org</a>, create an account and subscribe (about $15/year).</li>"
+        "<li>Add your bank there: search for <b>U.S. Bank</b> and sign in (repeat for each bank or card issuer). "
+        "Check your bank is supported before paying.</li>"
+        "<li>Create a <b>Setup Token</b> for a new app connection (name it “Ledgerly”) and copy it.</li>"
+        "<li>Paste the token below. It can be used only once.</li></ol>"));
+    steps->setTextFormat(Qt::RichText);
+    steps->setOpenExternalLinks(true);
+    steps->setWordWrap(true);
+    l->addWidget(steps);
+    auto *token = new QPlainTextEdit;
+    token->setObjectName(QStringLiteral("setupToken"));
+    token->setPlaceholderText(QStringLiteral("Paste the SimpleFIN setup token here"));
+    token->setFixedHeight(80);
+    l->addWidget(token);
+    l->addWidget(ui::muted(QStringLiteral("Your bank accounts and cards are added to Ledgerly automatically, then the last 60 days of transactions are "
+                                          "imported with the usual categories, rules and duplicate checks. The connection is saved only on this computer.")));
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Connect"));
+    bb->button(QDialogButtonBox::Ok)->setObjectName(QStringLiteral("primary"));
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    l->addWidget(bb);
+    if (dlg.exec() != QDialog::Accepted || token->toPlainText().trimmed().isEmpty()) return;
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QString err;
+    const bool ok = simplefin::connect(Store::instance(), token->toPlainText().simplified().remove(QLatin1Char(' ')), &err);
+    simplefin::DownloadResult r;
+    if (ok) r = simplefin::download(Store::instance(), true);
+    QApplication::restoreOverrideCursor();
+    if (!ok) {
+        QMessageBox::warning(this, QStringLiteral("Connect bank"), err);
+    } else if (!r.ok) {
+        QMessageBox::warning(this, QStringLiteral("Connect bank"), QStringLiteral("Connected, but the first download failed: %1").arg(r.error));
+    } else {
+        QMessageBox::information(this, QStringLiteral("Connect bank"),
+                                 QStringLiteral("Connected: %1.\n\n%2 transactions imported from the last 60 days.%3")
+                                     .arg(simplefin::linkedAccountNames(Store::instance()).join(QStringLiteral(", ")))
+                                     .arg(r.imported)
+                                     .arg(r.skipped ? QStringLiteral(" %1 were skipped as possible duplicates of what you already entered.").arg(r.skipped) : QString()));
+    }
+    refresh();
 }
