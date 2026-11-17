@@ -1,5 +1,6 @@
 #include "Backup.h"
 #include "Defaults.h"
+#include "Json.h"
 #include "Store.h"
 #include "Util.h"
 #include "Xlsx.h"
@@ -22,11 +23,7 @@ namespace backup {
 
 namespace {
 
-QString clip(const QJsonValue &v, int max)
-{
-    QString s = v.isString() ? v.toString() : (v.isDouble() ? QString::number(v.toDouble()) : QString());
-    return s.left(max);
-}
+using json::clip;
 
 bool decodeDataUrl(const QString &url, QByteArray *data, QString *mime)
 {
@@ -64,71 +61,22 @@ QByteArray toJson(const Store &store, bool includeReceipts, int *receiptCount)
     so[QStringLiteral("backupReminderDays")] = s.backupReminderDays;
     root[QStringLiteral("settings")] = so;
 
-    QJsonArray cats;
-    for (const auto &c : store.categories()) {
-        QJsonObject o;
-        o[QStringLiteral("id")] = c.id;
-        o[QStringLiteral("name")] = c.name;
-        o[QStringLiteral("type")] = typeToString(c.type);
-        o[QStringLiteral("icon")] = c.icon;
-        o[QStringLiteral("budget")] = static_cast<double>(c.budget);
-        o[QStringLiteral("createdAt")] = c.createdAt;
-        cats.append(o);
-    }
+    QJsonArray cats, txs, rules, accounts, importRules;
+    for (const auto &c : store.categories()) cats.append(json::from(c));
+    for (const auto &t : store.transactions()) txs.append(json::from(t));
+    for (const auto &r : store.recurring()) rules.append(json::from(r));
+    for (const auto &acc : store.accounts()) accounts.append(json::from(acc));
+    for (const auto &ir : store.importRules()) importRules.append(json::from(ir));
     root[QStringLiteral("categories")] = cats;
-
-    QJsonArray txs;
-    for (const auto &t : store.transactions()) {
-        QJsonObject o;
-        o[QStringLiteral("id")] = t.id;
-        o[QStringLiteral("type")] = typeToString(t.type);
-        o[QStringLiteral("categoryId")] = t.categoryId;
-        o[QStringLiteral("amount")] = static_cast<double>(t.amount);
-        o[QStringLiteral("date")] = t.date.toString(Qt::ISODate);
-        o[QStringLiteral("description")] = t.description;
-        o[QStringLiteral("vendor")] = t.vendor;
-        o[QStringLiteral("paymentMethod")] = t.paymentMethod;
-        o[QStringLiteral("notes")] = t.notes;
-        o[QStringLiteral("createdAt")] = t.createdAt;
-        o[QStringLiteral("updatedAt")] = t.updatedAt;
-        if (!t.recurringId.isEmpty()) o[QStringLiteral("recurringId")] = t.recurringId;
-        txs.append(o);
-    }
     root[QStringLiteral("transactions")] = txs;
-
-    QJsonArray rules;
-    for (const auto &r : store.recurring()) {
-        QJsonObject o;
-        o[QStringLiteral("id")] = r.id;
-        o[QStringLiteral("type")] = typeToString(r.type);
-        o[QStringLiteral("categoryId")] = r.categoryId;
-        o[QStringLiteral("amount")] = static_cast<double>(r.amount);
-        o[QStringLiteral("description")] = r.description;
-        o[QStringLiteral("vendor")] = r.vendor;
-        o[QStringLiteral("paymentMethod")] = r.paymentMethod;
-        o[QStringLiteral("notes")] = r.notes;
-        o[QStringLiteral("frequency")] = frequencyToString(r.frequency);
-        o[QStringLiteral("day")] = r.day;
-        o[QStringLiteral("startDate")] = r.startDate.toString(Qt::ISODate);
-        o[QStringLiteral("endDate")] = r.endDate.isValid() ? r.endDate.toString(Qt::ISODate) : QString();
-        o[QStringLiteral("nextDate")] = r.nextDate.isValid() ? r.nextDate.toString(Qt::ISODate) : QString();
-        o[QStringLiteral("active")] = r.active;
-        o[QStringLiteral("createdAt")] = r.createdAt;
-        o[QStringLiteral("updatedAt")] = r.updatedAt;
-        rules.append(o);
-    }
     root[QStringLiteral("recurring")] = rules;
+    root[QStringLiteral("accounts")] = accounts;
+    root[QStringLiteral("importRules")] = importRules;
 
     QJsonArray recs;
     if (includeReceipts) {
         for (const auto &r : store.allReceipts()) {
-            QJsonObject o;
-            o[QStringLiteral("id")] = r.id;
-            o[QStringLiteral("transactionId")] = r.transactionId;
-            o[QStringLiteral("name")] = r.name;
-            o[QStringLiteral("mime")] = r.mime;
-            o[QStringLiteral("size")] = static_cast<double>(r.data.size());
-            o[QStringLiteral("createdAt")] = r.createdAt;
+            QJsonObject o = json::receiptMeta(r);
             o[QStringLiteral("data")] = QStringLiteral("data:%1;base64,%2").arg(r.mime, QString::fromLatin1(r.data.toBase64()));
             recs.append(o);
         }
@@ -171,82 +119,36 @@ bool parse(const QByteArray &json, BackupData *out, QString *error)
     if (rem == 0 || rem == 1 || rem == 7 || rem == 30) d.settings.backupReminderDays = rem;
 
     for (const QJsonValue &v : root.value(QStringLiteral("categories")).toArray()) {
-        const QJsonObject o = v.toObject();
         Category c;
-        c.id = clip(o.value(QStringLiteral("id")), 100);
-        c.name = clip(o.value(QStringLiteral("name")), 60).simplified();
-        if (c.id.isEmpty() || c.name.isEmpty()) continue;
-        c.type = typeFromString(o.value(QStringLiteral("type")).toString());
-        c.icon = clip(o.value(QStringLiteral("icon")), 16);
-        if (c.icon.isEmpty()) c.icon = QStringLiteral("🏷");
-        const double b = o.value(QStringLiteral("budget")).toDouble();
-        c.budget = (b > 0 && c.type == TxType::Expense) ? static_cast<qint64>(b) : 0;
-        c.createdAt = clip(o.value(QStringLiteral("createdAt")), 40);
-        if (c.createdAt.isEmpty()) c.createdAt = util::nowIso();
-        d.categories.push_back(c);
+        if (json::to(v.toObject(), &c)) d.categories.push_back(c);
     }
-
     for (const QJsonValue &v : root.value(QStringLiteral("transactions")).toArray()) {
-        const QJsonObject o = v.toObject();
         Transaction t;
-        t.id = clip(o.value(QStringLiteral("id")), 100);
-        t.date = QDate::fromString(o.value(QStringLiteral("date")).toString(), Qt::ISODate);
-        const QJsonValue amt = o.value(QStringLiteral("amount"));
-        if (t.id.isEmpty() || !t.date.isValid() || !amt.isDouble()) continue;
-        t.amount = std::llabs(static_cast<qint64>(std::llround(amt.toDouble())));
-        t.type = typeFromString(o.value(QStringLiteral("type")).toString());
-        t.categoryId = clip(o.value(QStringLiteral("categoryId")), 100);
-        t.description = clip(o.value(QStringLiteral("description")), 200);
-        t.vendor = clip(o.value(QStringLiteral("vendor")), 120);
-        t.paymentMethod = clip(o.value(QStringLiteral("paymentMethod")), 60);
-        t.notes = clip(o.value(QStringLiteral("notes")), 2000);
-        t.createdAt = clip(o.value(QStringLiteral("createdAt")), 40);
-        t.updatedAt = clip(o.value(QStringLiteral("updatedAt")), 40);
-        t.recurringId = clip(o.value(QStringLiteral("recurringId")), 100);
-        d.transactions.push_back(t);
+        if (json::to(v.toObject(), &t)) d.transactions.push_back(t);
     }
-
-    // Recurring rules (absent in older and web-app backups)
+    // Recurring rules, accounts and import rules are absent in older and web-app backups
     for (const QJsonValue &v : root.value(QStringLiteral("recurring")).toArray()) {
-        const QJsonObject o = v.toObject();
         Recurring r;
-        r.id = clip(o.value(QStringLiteral("id")), 100);
-        r.startDate = QDate::fromString(o.value(QStringLiteral("startDate")).toString(), Qt::ISODate);
-        const QJsonValue amt = o.value(QStringLiteral("amount"));
-        if (r.id.isEmpty() || !r.startDate.isValid() || !amt.isDouble()) continue;
-        r.amount = std::llabs(static_cast<qint64>(std::llround(amt.toDouble())));
-        r.type = typeFromString(o.value(QStringLiteral("type")).toString());
-        r.categoryId = clip(o.value(QStringLiteral("categoryId")), 100);
-        r.description = clip(o.value(QStringLiteral("description")), 200);
-        r.vendor = clip(o.value(QStringLiteral("vendor")), 120);
-        r.paymentMethod = clip(o.value(QStringLiteral("paymentMethod")), 60);
-        r.notes = clip(o.value(QStringLiteral("notes")), 2000);
-        r.frequency = frequencyFromString(o.value(QStringLiteral("frequency")).toString());
-        r.day = std::clamp(o.value(QStringLiteral("day")).toInt(r.startDate.day()), 1, 31);
-        r.endDate = QDate::fromString(o.value(QStringLiteral("endDate")).toString(), Qt::ISODate);
-        r.nextDate = QDate::fromString(o.value(QStringLiteral("nextDate")).toString(), Qt::ISODate);
-        if (!r.nextDate.isValid()) r.nextDate = r.startDate;
-        r.active = o.value(QStringLiteral("active")).toBool(true);
-        r.createdAt = clip(o.value(QStringLiteral("createdAt")), 40);
-        r.updatedAt = clip(o.value(QStringLiteral("updatedAt")), 40);
-        d.recurring.push_back(r);
+        if (json::to(v.toObject(), &r)) d.recurring.push_back(r);
+    }
+    for (const QJsonValue &v : root.value(QStringLiteral("accounts")).toArray()) {
+        Account acc;
+        if (json::to(v.toObject(), &acc)) d.accounts.push_back(acc);
+    }
+    for (const QJsonValue &v : root.value(QStringLiteral("importRules")).toArray()) {
+        ImportRule ir;
+        if (json::to(v.toObject(), &ir)) d.importRules.push_back(ir);
     }
 
     for (const QJsonValue &v : root.value(QStringLiteral("receipts")).toArray()) {
         const QJsonObject o = v.toObject();
         Receipt r;
-        r.id = clip(o.value(QStringLiteral("id")), 100);
-        r.transactionId = clip(o.value(QStringLiteral("transactionId")), 100);
-        if (r.id.isEmpty() || r.transactionId.isEmpty()) continue;
+        if (!json::receiptFromMeta(o, &r)) continue;
         if (!decodeDataUrl(o.value(QStringLiteral("data")).toString(), &r.data, &r.mime)) {
             if (error) *error = QStringLiteral("A receipt in the backup is corrupted.");
             return false;
         }
-        r.name = clip(o.value(QStringLiteral("name")), 200);
-        if (r.name.isEmpty()) r.name = QStringLiteral("receipt");
         r.size = r.data.size();
-        r.createdAt = clip(o.value(QStringLiteral("createdAt")), 40);
-        if (r.createdAt.isEmpty()) r.createdAt = util::nowIso();
         d.receipts.push_back(r);
     }
 

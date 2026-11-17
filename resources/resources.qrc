@@ -2,10 +2,13 @@
   <qresource prefix="/">
     <file>icons/alert.svg</file>
     <file>icons/app.svg</file>
+    <file>icons/bank.svg</file>
     <file>icons/camera.svg</file>
+    <file>icons/card.svg</file>
     <file>icons/chart.svg</file>
     <file>icons/check.svg</file>
     <file>icons/clip.svg</file>
+    <file>icons/cloud.svg</file>
     <file>icons/dashboard.svg</file>
     <file>icons/database.svg</file>
     <file>icons/download.svg</file>
@@ -15,11 +18,13 @@
     <file>icons/file.svg</file>
     <file>icons/folder.svg</file>
     <file>icons/left.svg</file>
+    <file>icons/link.svg</file>
     <file>icons/list.svg</file>
     <file>icons/menu.svg</file>
     <file>icons/pdf.svg</file>
     <file>icons/plus.svg</file>
     <file>icons/print.svg</file>
+    <file>icons/refresh.svg</file>
     <file>icons/repeat.svg</file>
     <file>icons/right.svg</file>
     <file>icons/search.svg</file>

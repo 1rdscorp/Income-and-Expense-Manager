@@ -1,5 +1,6 @@
 #include "Store.h"
 #include "Defaults.h"
+#include "Json.h"
 #include "Recurrence.h"
 #include "Util.h"
 
@@ -10,6 +11,7 @@
 #include <QSet>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QTimeZone>
 #include <QVariant>
 #include <algorithm>
 #include <random>
@@ -82,6 +84,13 @@ bool Store::open(const QString &dataDir, QString *error)
     exec(QStringLiteral("PRAGMA foreign_keys = OFF"));
     if (!createSchema(error)) return false;
 
+    m_deviceId = localValue(QStringLiteral("device_id"));
+    if (m_deviceId.isEmpty()) {
+        m_deviceId = util::newId();
+        setLocalValue(QStringLiteral("device_id"), m_deviceId);
+    }
+    m_tracking = !syncConfig().value(QStringLiteral("folder")).toString().isEmpty();
+
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT value FROM meta WHERE key = 'settings'"));
     if (q.exec() && q.next())
@@ -138,14 +147,28 @@ bool Store::createSchema(QString *error)
     for (const char *s : stmts)
         if (!exec(QString::fromLatin1(s), error)) return false;
 
-    // v1.0 databases: add the link from transactions to their recurring rule
-    QSqlQuery info(m_db);
-    bool hasRecurringId = false;
-    if (info.exec(QStringLiteral("PRAGMA table_info(transactions)")))
-        while (info.next())
-            if (info.value(1).toString() == QLatin1String("recurring_id")) hasRecurringId = true;
-    if (!hasRecurringId && !exec(QStringLiteral("ALTER TABLE transactions ADD COLUMN recurring_id TEXT"), error)) return false;
-    return exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_tx_recurring ON transactions(recurring_id)"), error);
+    // Older databases: add newer columns in place
+    if (!addColumnIfMissing(QStringLiteral("transactions"), QStringLiteral("recurring_id"), QStringLiteral("TEXT"), error)) return false; // v1.1
+    if (!addColumnIfMissing(QStringLiteral("transactions"), QStringLiteral("account_id"), QStringLiteral("TEXT"), error)) return false;   // v1.3
+    if (!addColumnIfMissing(QStringLiteral("transactions"), QStringLiteral("external_id"), QStringLiteral("TEXT"), error)) return false;  // v1.3
+    const char *more[] = {
+        "CREATE INDEX IF NOT EXISTS idx_tx_recurring ON transactions(recurring_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tx_external ON transactions(account_id, external_id)",
+        "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT, flip_signs INTEGER NOT NULL DEFAULT 0,"
+        " csv_mapping TEXT, created_at TEXT, updated_at TEXT)",
+        "CREATE TABLE IF NOT EXISTS import_rules (id TEXT PRIMARY KEY, pattern TEXT NOT NULL, category_id TEXT,"
+        " ignore INTEGER NOT NULL DEFAULT 0, created_at TEXT, updated_at TEXT)",
+        // statement lines imported on this computer (kept even if the transaction is deleted later)
+        "CREATE TABLE IF NOT EXISTS import_seen (account_id TEXT NOT NULL, external_id TEXT NOT NULL, PRIMARY KEY(account_id, external_id))",
+        // shared-folder sync: local changes waiting to be written, last change time per record, journal files applied
+        "CREATE TABLE IF NOT EXISTS sync_outbox (entity TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(entity, id))",
+        "CREATE TABLE IF NOT EXISTS sync_versions (entity TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, device TEXT, PRIMARY KEY(entity, id))",
+        "CREATE TABLE IF NOT EXISTS sync_files (name TEXT PRIMARY KEY)",
+        "CREATE TABLE IF NOT EXISTS local (key TEXT PRIMARY KEY, value TEXT)",
+    };
+    for (const char *m : more)
+        if (!exec(QString::fromLatin1(m), error)) return false;
+    return true;
 }
 
 void Store::loadCache()
@@ -154,6 +177,9 @@ void Store::loadCache()
     m_transactions.clear();
     m_receiptCounts.clear();
     m_recurring.clear();
+    m_accounts.clear();
+    m_importRules.clear();
+    m_importedKeys.clear();
     m_receiptBytes = 0;
 
     QSqlQuery q(m_db);
@@ -171,7 +197,7 @@ void Store::loadCache()
     sortCategories();
 
     q.exec(QStringLiteral("SELECT id, type, category_id, amount, date, description, vendor, payment_method, notes,"
-                          " created_at, updated_at, recurring_id FROM transactions"));
+                          " created_at, updated_at, recurring_id, account_id, external_id FROM transactions"));
     while (q.next()) {
         Transaction t;
         t.id = q.value(0).toString();
@@ -186,6 +212,9 @@ void Store::loadCache()
         t.createdAt = q.value(9).toString();
         t.updatedAt = q.value(10).toString();
         t.recurringId = q.value(11).toString();
+        t.accountId = q.value(12).toString();
+        t.externalId = q.value(13).toString();
+        if (!t.externalId.isEmpty()) m_importedKeys.insert(t.accountId + QLatin1Char('|') + t.externalId);
         m_transactions.push_back(t);
     }
     sortTransactions();
@@ -213,6 +242,34 @@ void Store::loadCache()
         m_recurring.push_back(r);
     }
     sortRecurring();
+
+    q.exec(QStringLiteral("SELECT id, name, kind, flip_signs, csv_mapping, created_at, updated_at FROM accounts"));
+    while (q.next()) {
+        Account a;
+        a.id = q.value(0).toString();
+        a.name = q.value(1).toString();
+        a.kind = q.value(2).toString() == QLatin1String("card") ? QStringLiteral("card") : QStringLiteral("bank");
+        a.flipSigns = q.value(3).toInt() != 0;
+        a.csvMapping = q.value(4).toString();
+        a.createdAt = q.value(5).toString();
+        a.updatedAt = q.value(6).toString();
+        m_accounts.push_back(a);
+    }
+    std::sort(m_accounts.begin(), m_accounts.end(), [](const Account &a, const Account &b) { return QString::localeAwareCompare(a.name, b.name) < 0; });
+    q.exec(QStringLiteral("SELECT id, pattern, category_id, ignore, created_at, updated_at FROM import_rules"));
+    while (q.next()) {
+        ImportRule r;
+        r.id = q.value(0).toString();
+        r.pattern = q.value(1).toString();
+        r.categoryId = q.value(2).toString();
+        r.ignore = q.value(3).toInt() != 0;
+        r.createdAt = q.value(4).toString();
+        r.updatedAt = q.value(5).toString();
+        m_importRules.push_back(r);
+    }
+    std::sort(m_importRules.begin(), m_importRules.end(), [](const ImportRule &a, const ImportRule &b) { return a.pattern.compare(b.pattern, Qt::CaseInsensitive) < 0; });
+    q.exec(QStringLiteral("SELECT account_id, external_id FROM import_seen"));
+    while (q.next()) m_importedKeys.insert(q.value(0).toString() + QLatin1Char('|') + q.value(1).toString());
 
     q.exec(QStringLiteral("SELECT transaction_id, COUNT(*), SUM(size) FROM receipts GROUP BY transaction_id"));
     while (q.next()) {
@@ -244,7 +301,9 @@ void Store::markDirty() { m_dirty = true; }
 
 bool Store::saveSettings(const Settings &s)
 {
+    const bool shared = s.businessName != m_settings.businessName || s.currency != m_settings.currency;
     m_settings = s;
+    if (shared) trackChange(QStringLiteral("settings"), QStringLiteral("business"));
     util::setCurrency(s.currency);
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("INSERT OR REPLACE INTO meta(key, value) VALUES('settings', ?)"));
@@ -297,7 +356,9 @@ bool Store::writeCategory(const Category &c)
     q.addBindValue(c.icon);
     q.addBindValue(c.budget);
     q.addBindValue(c.createdAt);
-    return q.exec();
+    const bool ok = q.exec();
+    if (ok) trackChange(QStringLiteral("category"), c.id);
+    return ok;
 }
 
 bool Store::saveCategory(const Category &input, QString *error)
@@ -341,9 +402,15 @@ bool Store::saveCategory(const Category &input, QString *error)
         m_db.rollback();
         return false;
     }
-    if (typeChanged)
+    if (typeChanged) {
         for (auto &r : m_recurring)
-            if (r.categoryId == c.id) r.type = c.type;
+            if (r.categoryId == c.id) {
+                r.type = c.type;
+                trackChange(QStringLiteral("recurring"), r.id);
+            }
+        for (const auto &t : m_transactions)
+            if (t.categoryId == c.id) trackChange(QStringLiteral("transaction"), t.id);
+    }
     if (old) m_categories[m_catIndex.value(c.id)] = c;
     else m_categories.push_back(c);
     if (typeChanged)
@@ -357,9 +424,12 @@ bool Store::saveCategory(const Category &input, QString *error)
 
 bool Store::deleteCategory(const QString &id, const QString &moveTo, QString *error)
 {
-    QStringList txIds;
+    QStringList txIds, ruleIds;
     for (const auto &t : m_transactions)
         if (t.categoryId == id) txIds << t.id;
+    for (const auto &r : m_recurring)
+        if (r.categoryId == id) ruleIds << r.id;
+    const QStringList receiptIds = moveTo.isEmpty() ? receiptIdsForTransactions(txIds) : QStringList();
 
     if (!moveTo.isEmpty() && (moveTo == id || !category(moveTo))) {
         if (error) *error = QStringLiteral("Choose a valid category to move transactions to.");
@@ -405,6 +475,12 @@ bool Store::deleteCategory(const QString &id, const QString &moveTo, QString *er
         q.addBindValue(id);
         ok = q.exec();
     }
+    if (ok) {
+        trackChange(QStringLiteral("category"), id);
+        for (const auto &x : txIds) trackChange(QStringLiteral("transaction"), x);
+        for (const auto &x : ruleIds) trackChange(QStringLiteral("recurring"), x);
+        for (const auto &x : receiptIds) trackChange(QStringLiteral("receipt"), x);
+    }
     if (!ok || !m_db.commit()) {
         if (error) *error = q.lastError().text();
         m_db.rollback();
@@ -425,7 +501,9 @@ int Store::seedDefaultCategories(bool all)
     for (const auto &d : defaults::categories()) {
         if (!all && have.contains(typeToString(d.type) + QLatin1Char('|') + d.name.toLower())) continue;
         Category c;
-        c.id = util::newId();
+        // Stable ids: two computers sharing a folder get the same default categories.
+        c.id = util::stableId(QStringLiteral("default-category|%1|%2").arg(typeToString(d.type), d.name));
+        if (category(c.id)) c.id = util::newId();
         c.name = d.name;
         c.type = d.type;
         c.icon = d.icon;
@@ -457,7 +535,8 @@ bool Store::writeTransaction(const Transaction &t)
 {
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("INSERT OR REPLACE INTO transactions(id, type, category_id, amount, date, description, vendor,"
-                             " payment_method, notes, created_at, updated_at, recurring_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"));
+                             " payment_method, notes, created_at, updated_at, recurring_id, account_id, external_id)"
+                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
     q.addBindValue(t.id);
     q.addBindValue(typeToString(t.type));
     q.addBindValue(t.categoryId);
@@ -469,8 +548,16 @@ bool Store::writeTransaction(const Transaction &t)
     q.addBindValue(t.notes);
     q.addBindValue(t.createdAt);
     q.addBindValue(t.updatedAt);
-    q.addBindValue(t.recurringId.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(t.recurringId));
-    return q.exec();
+    const QVariant null{QMetaType(QMetaType::QString)};
+    q.addBindValue(t.recurringId.isEmpty() ? null : QVariant(t.recurringId));
+    q.addBindValue(t.accountId.isEmpty() ? null : QVariant(t.accountId));
+    q.addBindValue(t.externalId.isEmpty() ? null : QVariant(t.externalId));
+    const bool ok = q.exec();
+    if (ok) {
+        trackChange(QStringLiteral("transaction"), t.id);
+        if (!t.externalId.isEmpty()) m_importedKeys.insert(t.accountId + QLatin1Char('|') + t.externalId);
+    }
+    return ok;
 }
 
 bool Store::writeRecurring(const Recurring &r)
@@ -495,7 +582,9 @@ bool Store::writeRecurring(const Recurring &r)
     q.addBindValue(r.active ? 1 : 0);
     q.addBindValue(r.createdAt);
     q.addBindValue(r.updatedAt);
-    return q.exec();
+    const bool ok = q.exec();
+    if (ok) trackChange(QStringLiteral("recurring"), r.id);
+    return ok;
 }
 
 bool Store::writeReceipt(const Receipt &r)
@@ -509,7 +598,9 @@ bool Store::writeReceipt(const Receipt &r)
     q.addBindValue(static_cast<qint64>(r.data.size()));
     q.addBindValue(r.data);
     q.addBindValue(r.createdAt);
-    return q.exec();
+    const bool ok = q.exec();
+    if (ok) trackChange(QStringLiteral("receipt"), r.id);
+    return ok;
 }
 
 bool Store::saveTransaction(const Transaction &input, const QVector<Receipt> &newReceipts,
@@ -550,6 +641,7 @@ bool Store::saveTransaction(const Transaction &input, const QVector<Receipt> &ne
         q.addBindValue(rid);
         q.addBindValue(t.id);
         ok = q.exec();
+        if (ok) trackChange(QStringLiteral("receipt"), rid);
     }
     if (!ok || !m_db.commit()) {
         if (error) *error = QStringLiteral("Could not save: %1").arg(m_db.lastError().text());
@@ -587,9 +679,12 @@ bool Store::saveTransaction(const Transaction &input, const QVector<Receipt> &ne
 bool Store::deleteTransactions(const QStringList &ids, QString *error)
 {
     if (ids.isEmpty()) return true;
+    const QStringList receiptIds = receiptIdsForTransactions(ids);
     m_db.transaction();
     bool ok = true;
+    for (const QString &rid : receiptIds) trackChange(QStringLiteral("receipt"), rid);
     for (const QString &id : ids) {
+        trackChange(QStringLiteral("transaction"), id);
         QSqlQuery q(m_db);
         q.prepare(QStringLiteral("DELETE FROM receipts WHERE transaction_id = ?"));
         q.addBindValue(id);
@@ -655,8 +750,11 @@ QVector<Receipt> Store::allReceipts() const
 
 bool Store::clearTables()
 {
+    trackAllExisting(); // deletions reach other computers sharing the folder
     return exec(QStringLiteral("DELETE FROM receipts")) && exec(QStringLiteral("DELETE FROM transactions")) &&
-           exec(QStringLiteral("DELETE FROM categories")) && exec(QStringLiteral("DELETE FROM recurring"));
+           exec(QStringLiteral("DELETE FROM categories")) && exec(QStringLiteral("DELETE FROM recurring")) &&
+           exec(QStringLiteral("DELETE FROM accounts")) && exec(QStringLiteral("DELETE FROM import_rules")) &&
+           exec(QStringLiteral("DELETE FROM import_seen"));
 }
 
 bool Store::replaceAll(const BackupData &data, QString *error)
@@ -667,6 +765,8 @@ bool Store::replaceAll(const BackupData &data, QString *error)
     for (const auto &t : data.transactions) ok = ok && writeTransaction(t);
     for (const auto &r : data.receipts) ok = ok && writeReceipt(r);
     for (const auto &r : data.recurring) ok = ok && writeRecurring(r);
+    for (const auto &a : data.accounts) ok = ok && writeAccount(a);
+    for (const auto &r : data.importRules) ok = ok && writeImportRule(r);
     if (!ok || !m_db.commit()) {
         if (error) *error = m_db.lastError().text();
         m_db.rollback();
@@ -728,6 +828,20 @@ bool Store::merge(const BackupData &data, MergeStats *stats, QString *error)
         r.categoryId = remap.value(r.categoryId, r.categoryId);
         newRules.push_back(r);
     }
+    QVector<Account> newAccounts;
+    for (const auto &a : data.accounts)
+        if (!account(a.id)) newAccounts.push_back(a);
+    QSet<QString> irIds, irPatterns;
+    for (const auto &r : m_importRules) {
+        irIds.insert(r.id);
+        irPatterns.insert(r.pattern.toLower());
+    }
+    QVector<ImportRule> newImportRules;
+    for (ImportRule r : data.importRules) {
+        if (irIds.contains(r.id) || irPatterns.contains(r.pattern.toLower())) continue;
+        r.categoryId = remap.value(r.categoryId, r.categoryId);
+        newImportRules.push_back(r);
+    }
 
     m_db.transaction();
     bool ok = true;
@@ -735,6 +849,8 @@ bool Store::merge(const BackupData &data, MergeStats *stats, QString *error)
     for (const auto &t : newTx) ok = ok && writeTransaction(t);
     for (const auto &r : newReceipts) ok = ok && writeReceipt(r);
     for (const auto &r : newRules) ok = ok && writeRecurring(r);
+    for (const auto &a : newAccounts) ok = ok && writeAccount(a);
+    for (const auto &r : newImportRules) ok = ok && writeImportRule(r);
     if (!ok || !m_db.commit()) {
         if (error) *error = m_db.lastError().text();
         m_db.rollback();
@@ -1056,6 +1172,11 @@ bool Store::deleteRecurring(const QString &id, QString *error)
         q.addBindValue(id);
         ok = q.exec();
     }
+    if (ok) {
+        trackChange(QStringLiteral("recurring"), id);
+        for (const auto &t : m_transactions)
+            if (t.recurringId == id) trackChange(QStringLiteral("transaction"), t.id);
+    }
     if (!ok || !m_db.commit()) {
         if (error) *error = q.lastError().text();
         m_db.rollback();
@@ -1081,7 +1202,8 @@ QVector<Transaction> Store::processRecurring(const QDate &today, bool notify)
         int guard = 0;
         while (r.nextDate.isValid() && r.nextDate <= today && !r.finished() && guard++ < 1000) {
             Transaction t;
-            t.id = util::newId();
+            // Same id on every computer, so two computers sharing a folder never record a payment twice.
+            t.id = util::stableId(QStringLiteral("recurring|%1|%2").arg(r.id, r.nextDate.toString(Qt::ISODate)));
             t.type = category(r.categoryId)->type;
             t.categoryId = r.categoryId;
             t.amount = r.amount;
@@ -1093,7 +1215,12 @@ QVector<Transaction> Store::processRecurring(const QDate &today, bool notify)
             t.createdAt = now;
             t.updatedAt = now;
             t.recurringId = r.id;
-            if (!writeTransaction(t)) break;
+            // Auto-recorded payments carry the due date as their change time, so a real edit
+            // made on any computer always counts as newer.
+            m_tsOverride = QDateTime(r.nextDate, QTime(0, 0), QTimeZone::utc()).toMSecsSinceEpoch();
+            const bool written = writeTransaction(t);
+            m_tsOverride = 0;
+            if (!written) break;
             posted.push_back(t);
             r.nextDate = recurrence::advance(r.nextDate, r.frequency, r.day);
             changed = true;
@@ -1219,4 +1346,533 @@ bool Store::backupIsStale() const
     const QDateTime last = QDateTime::fromString(m_settings.lastBackupAt, Qt::ISODateWithMs);
     if (!last.isValid()) return true;
     return last.secsTo(QDateTime::currentDateTimeUtc()) >= static_cast<qint64>(days) * 86400;
+}
+
+/* ---------------- Bank accounts & import rules ---------------- */
+
+const Account *Store::account(const QString &id) const
+{
+    for (const auto &a : m_accounts)
+        if (a.id == id) return &a;
+    return nullptr;
+}
+
+bool Store::writeAccount(const Account &a)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO accounts(id, name, kind, flip_signs, csv_mapping, created_at, updated_at) VALUES(?,?,?,?,?,?,?)"));
+    q.addBindValue(a.id);
+    q.addBindValue(a.name);
+    q.addBindValue(a.kind);
+    q.addBindValue(a.flipSigns ? 1 : 0);
+    q.addBindValue(a.csvMapping);
+    q.addBindValue(a.createdAt);
+    q.addBindValue(a.updatedAt);
+    const bool ok = q.exec();
+    if (ok) trackChange(QStringLiteral("account"), a.id);
+    return ok;
+}
+
+bool Store::saveAccount(const Account &input, QString *error, QString *savedId)
+{
+    Account a = input;
+    a.name = a.name.simplified();
+    if (a.name.isEmpty()) {
+        if (error) *error = QStringLiteral("Enter a name for the account, e.g. \"Business Visa\".");
+        return false;
+    }
+    for (const auto &x : m_accounts)
+        if (x.id != a.id && x.name.compare(a.name, Qt::CaseInsensitive) == 0) {
+            if (error) *error = QStringLiteral("An account named \"%1\" already exists.").arg(a.name);
+            return false;
+        }
+    const QString now = util::nowIso();
+    if (a.id.isEmpty()) a.id = util::newId();
+    if (a.createdAt.isEmpty()) a.createdAt = now;
+    a.updatedAt = now;
+    if (!writeAccount(a)) {
+        if (error) *error = m_db.lastError().text();
+        return false;
+    }
+    bool found = false;
+    for (auto &x : m_accounts)
+        if (x.id == a.id) {
+            x = a;
+            found = true;
+        }
+    if (!found) m_accounts.push_back(a);
+    std::sort(m_accounts.begin(), m_accounts.end(), [](const Account &x, const Account &y) { return QString::localeAwareCompare(x.name, y.name) < 0; });
+    if (savedId) *savedId = a.id;
+    markDirty();
+    emit dataChanged();
+    return true;
+}
+
+bool Store::deleteAccount(const QString &id, QString *error)
+{
+    m_db.transaction();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM accounts WHERE id = ?"));
+    q.addBindValue(id);
+    bool ok = q.exec();
+    if (ok) {
+        q.prepare(QStringLiteral("DELETE FROM import_seen WHERE account_id = ?"));
+        q.addBindValue(id);
+        ok = q.exec();
+    }
+    if (ok) {
+        trackChange(QStringLiteral("account"), id);
+        // Imported transactions stay, they just no longer point at the account.
+        for (Transaction t : m_transactions) {
+            if (t.accountId != id) continue;
+            t.accountId.clear();
+            ok = ok && writeTransaction(t);
+        }
+    }
+    if (!ok || !m_db.commit()) {
+        if (error) *error = m_db.lastError().text();
+        m_db.rollback();
+        return false;
+    }
+    loadCache();
+    markDirty();
+    emit dataChanged();
+    return true;
+}
+
+int Store::accountTransactionCount(const QString &accountId) const
+{
+    int n = 0;
+    for (const auto &t : m_transactions)
+        if (t.accountId == accountId) ++n;
+    return n;
+}
+
+bool Store::writeImportRule(const ImportRule &r)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO import_rules(id, pattern, category_id, ignore, created_at, updated_at) VALUES(?,?,?,?,?,?)"));
+    q.addBindValue(r.id);
+    q.addBindValue(r.pattern);
+    q.addBindValue(r.categoryId);
+    q.addBindValue(r.ignore ? 1 : 0);
+    q.addBindValue(r.createdAt);
+    q.addBindValue(r.updatedAt);
+    const bool ok = q.exec();
+    if (ok) trackChange(QStringLiteral("rule"), r.id);
+    return ok;
+}
+
+bool Store::saveImportRule(const ImportRule &input, QString *error)
+{
+    ImportRule r = input;
+    r.pattern = r.pattern.simplified();
+    if (r.pattern.size() < 2) {
+        if (error) *error = QStringLiteral("Enter at least 2 characters to look for in the bank description.");
+        return false;
+    }
+    if (!r.ignore && !category(r.categoryId)) {
+        if (error) *error = QStringLiteral("Choose a category, or choose to ignore matching lines.");
+        return false;
+    }
+    for (const auto &x : m_importRules)
+        if (x.id != r.id && x.pattern.compare(r.pattern, Qt::CaseInsensitive) == 0) {
+            if (error) *error = QStringLiteral("There is already a rule for \"%1\".").arg(r.pattern);
+            return false;
+        }
+    const QString now = util::nowIso();
+    if (r.id.isEmpty()) r.id = util::newId();
+    if (r.createdAt.isEmpty()) r.createdAt = now;
+    r.updatedAt = now;
+    if (r.ignore) r.categoryId.clear();
+    if (!writeImportRule(r)) {
+        if (error) *error = m_db.lastError().text();
+        return false;
+    }
+    bool found = false;
+    for (auto &x : m_importRules)
+        if (x.id == r.id) {
+            x = r;
+            found = true;
+        }
+    if (!found) m_importRules.push_back(r);
+    std::sort(m_importRules.begin(), m_importRules.end(), [](const ImportRule &a, const ImportRule &b) { return a.pattern.compare(b.pattern, Qt::CaseInsensitive) < 0; });
+    markDirty();
+    emit dataChanged();
+    return true;
+}
+
+bool Store::deleteImportRule(const QString &id)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM import_rules WHERE id = ?"));
+    q.addBindValue(id);
+    if (!q.exec()) return false;
+    trackChange(QStringLiteral("rule"), id);
+    m_importRules.erase(std::remove_if(m_importRules.begin(), m_importRules.end(), [&](const ImportRule &r) { return r.id == id; }), m_importRules.end());
+    markDirty();
+    emit dataChanged();
+    return true;
+}
+
+bool Store::alreadyImported(const QString &accountId, const QString &externalId) const
+{
+    return !externalId.isEmpty() && m_importedKeys.contains(accountId + QLatin1Char('|') + externalId);
+}
+
+int Store::importTransactions(const QVector<Transaction> &txs, QString *error)
+{
+    if (txs.isEmpty()) return 0;
+    const QString now = util::nowIso();
+    QVector<Transaction> done;
+    m_db.transaction();
+    bool ok = true;
+    for (Transaction t : txs) {
+        if (!category(t.categoryId) || t.amount <= 0 || !t.date.isValid()) continue;
+        if (alreadyImported(t.accountId, t.externalId)) continue;
+        t.type = category(t.categoryId)->type;
+        if (t.id.isEmpty()) t.id = util::newId();
+        if (t.createdAt.isEmpty()) t.createdAt = now;
+        t.updatedAt = now;
+        ok = writeTransaction(t);
+        if (!ok) break;
+        if (!t.externalId.isEmpty()) {
+            QSqlQuery q(m_db);
+            q.prepare(QStringLiteral("INSERT OR IGNORE INTO import_seen(account_id, external_id) VALUES(?,?)"));
+            q.addBindValue(t.accountId);
+            q.addBindValue(t.externalId);
+            q.exec();
+        }
+        done.push_back(t);
+    }
+    if (!ok || !m_db.commit()) {
+        if (error) *error = m_db.lastError().text();
+        m_db.rollback();
+        loadCache();
+        return -1;
+    }
+    m_transactions += done;
+    sortTransactions();
+    if (!done.isEmpty()) {
+        markDirty();
+        emit dataChanged();
+    }
+    return static_cast<int>(done.size());
+}
+
+/* ---------------- Local key/value ---------------- */
+
+QString Store::localValue(const QString &key) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT value FROM local WHERE key = ?"));
+    q.addBindValue(key);
+    if (q.exec() && q.next()) return q.value(0).toString();
+    return {};
+}
+
+void Store::setLocalValue(const QString &key, const QString &value)
+{
+    QSqlQuery q(m_db);
+    if (value.isEmpty()) {
+        q.prepare(QStringLiteral("DELETE FROM local WHERE key = ?"));
+        q.addBindValue(key);
+    } else {
+        q.prepare(QStringLiteral("INSERT OR REPLACE INTO local(key, value) VALUES(?, ?)"));
+        q.addBindValue(key);
+        q.addBindValue(value);
+    }
+    q.exec();
+}
+
+/* ---------------- Sync support ---------------- */
+
+bool Store::addColumnIfMissing(const QString &table, const QString &column, const QString &type, QString *error)
+{
+    QSqlQuery info(m_db);
+    if (info.exec(QStringLiteral("PRAGMA table_info(%1)").arg(table)))
+        while (info.next())
+            if (info.value(1).toString() == column) return true;
+    return exec(QStringLiteral("ALTER TABLE %1 ADD COLUMN %2 %3").arg(table, column, type), error);
+}
+
+QStringList Store::receiptIdsForTransactions(const QStringList &txIds) const
+{
+    QStringList out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT id FROM receipts WHERE transaction_id = ?"));
+    for (const QString &id : txIds) {
+        q.bindValue(0, id);
+        if (q.exec())
+            while (q.next()) out << q.value(0).toString();
+    }
+    return out;
+}
+
+qint64 Store::nextTs()
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    m_lastTs = std::max(now, m_lastTs + 1);
+    return m_lastTs;
+}
+
+void Store::trackChange(const QString &entity, const QString &id)
+{
+    if (!m_tracking || m_applyingRemote || id.isEmpty()) return;
+    const qint64 ts = m_tsOverride ? m_tsOverride : nextTs();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO sync_outbox(entity, id, ts) VALUES(?,?,?)"));
+    q.addBindValue(entity);
+    q.addBindValue(id);
+    q.addBindValue(ts);
+    q.exec();
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO sync_versions(entity, id, ts, device) VALUES(?,?,?,?)"));
+    q.addBindValue(entity);
+    q.addBindValue(id);
+    q.addBindValue(ts);
+    q.addBindValue(m_deviceId);
+    q.exec();
+}
+
+void Store::trackAllExisting()
+{
+    if (!m_tracking || m_applyingRemote) return;
+    const std::pair<const char *, const char *> tables[] = {
+        {"category", "categories"}, {"transaction", "transactions"}, {"receipt", "receipts"},
+        {"recurring", "recurring"}, {"account", "accounts"},         {"rule", "import_rules"},
+    };
+    for (const auto &t : tables) {
+        QSqlQuery q(m_db);
+        QStringList ids;
+        if (q.exec(QStringLiteral("SELECT id FROM %1").arg(QString::fromLatin1(t.second))))
+            while (q.next()) ids << q.value(0).toString();
+        for (const QString &id : ids) trackChange(QString::fromLatin1(t.first), id);
+    }
+}
+
+void Store::trackEverything()
+{
+    m_db.transaction();
+    trackAllExisting();
+    trackChange(QStringLiteral("settings"), QStringLiteral("business"));
+    m_db.commit();
+}
+
+QVector<Store::Change> Store::pendingChanges(int limit) const
+{
+    QVector<Change> out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT entity, id, ts FROM sync_outbox ORDER BY ts LIMIT ?"));
+    q.addBindValue(limit);
+    if (q.exec())
+        while (q.next()) out.push_back({q.value(0).toString(), q.value(1).toString(), q.value(2).toLongLong()});
+    return out;
+}
+
+int Store::pendingChangeCount() const
+{
+    QSqlQuery q(m_db);
+    if (q.exec(QStringLiteral("SELECT COUNT(*) FROM sync_outbox")) && q.next()) return q.value(0).toInt();
+    return 0;
+}
+
+void Store::clearPendingChanges(const QVector<Change> &done)
+{
+    m_db.transaction();
+    QSqlQuery q(m_db);
+    // Only remove entries that were not changed again in the meantime.
+    q.prepare(QStringLiteral("DELETE FROM sync_outbox WHERE entity = ? AND id = ? AND ts = ?"));
+    for (const auto &c : done) {
+        q.bindValue(0, c.entity);
+        q.bindValue(1, c.id);
+        q.bindValue(2, c.ts);
+        q.exec();
+    }
+    m_db.commit();
+}
+
+QJsonObject Store::recordJson(const QString &entity, const QString &id, bool *exists) const
+{
+    *exists = true;
+    if (entity == QLatin1String("category")) {
+        if (const Category *c = category(id)) return json::from(*c);
+    } else if (entity == QLatin1String("transaction")) {
+        if (const Transaction *t = transaction(id)) return json::from(*t);
+    } else if (entity == QLatin1String("recurring")) {
+        if (const Recurring *r = recurringRule(id)) return json::from(*r);
+    } else if (entity == QLatin1String("account")) {
+        if (const Account *a = account(id)) return json::from(*a);
+    } else if (entity == QLatin1String("rule")) {
+        for (const auto &r : m_importRules)
+            if (r.id == id) return json::from(r);
+    } else if (entity == QLatin1String("receipt")) {
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral("SELECT id, transaction_id, name, mime, size, created_at FROM receipts WHERE id = ?"));
+        q.addBindValue(id);
+        if (q.exec() && q.next()) {
+            Receipt r;
+            r.id = q.value(0).toString();
+            r.transactionId = q.value(1).toString();
+            r.name = q.value(2).toString();
+            r.mime = q.value(3).toString();
+            r.size = q.value(4).toLongLong();
+            r.createdAt = q.value(5).toString();
+            return json::receiptMeta(r);
+        }
+    } else if (entity == QLatin1String("settings")) {
+        QJsonObject o;
+        o[QStringLiteral("businessName")] = m_settings.businessName;
+        o[QStringLiteral("currency")] = m_settings.currency;
+        return o;
+    }
+    *exists = false;
+    return {};
+}
+
+QByteArray Store::receiptData(const QString &id) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT data FROM receipts WHERE id = ?"));
+    q.addBindValue(id);
+    if (q.exec() && q.next()) return q.value(0).toByteArray();
+    return {};
+}
+
+void Store::beginRemoteBatch()
+{
+    m_applyingRemote = true;
+    m_db.transaction();
+}
+
+void Store::endRemoteBatch(bool changed)
+{
+    m_db.commit();
+    m_applyingRemote = false;
+    if (changed) {
+        loadCache();
+        markDirty();
+        emit dataChanged();
+        emit settingsChanged();
+    }
+}
+
+Store::ApplyResult Store::applyRemote(const QString &entity, const QString &id, qint64 ts, const QString &device, bool deleted,
+                                      const QJsonObject &data, const std::function<bool(QByteArray *)> &loadReceipt)
+{
+    // Last writer wins: skip if our copy is as new or newer.
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT ts, device FROM sync_versions WHERE entity = ? AND id = ?"));
+    q.addBindValue(entity);
+    q.addBindValue(id);
+    if (q.exec() && q.next()) {
+        const qint64 ours = q.value(0).toLongLong();
+        const QString ourDevice = q.value(1).toString();
+        if (ts < ours || (ts == ours && device <= ourDevice)) return ApplyResult::Skipped;
+    }
+
+    auto del = [&](const QString &sql) {
+        QSqlQuery d(m_db);
+        d.prepare(sql);
+        d.addBindValue(id);
+        return d.exec();
+    };
+    bool ok = true;
+    if (entity == QLatin1String("settings")) {
+        if (!deleted) {
+            const QString name = data.value(QStringLiteral("businessName")).toString().left(80);
+            if (!name.isEmpty()) m_settings.businessName = name;
+            const QString cur = data.value(QStringLiteral("currency")).toString();
+            for (const auto &c : defaults::currencies())
+                if (c.code == cur) m_settings.currency = cur;
+            util::setCurrency(m_settings.currency);
+            QSqlQuery w(m_db);
+            w.prepare(QStringLiteral("INSERT OR REPLACE INTO meta(key, value) VALUES('settings', ?)"));
+            w.addBindValue(QString::fromUtf8(QJsonDocument(settingsToJson(m_settings)).toJson(QJsonDocument::Compact)));
+            ok = w.exec();
+        }
+    } else if (entity == QLatin1String("category")) {
+        Category c;
+        ok = deleted ? del(QStringLiteral("DELETE FROM categories WHERE id = ?")) : (json::to(data, &c) && writeCategory(c));
+    } else if (entity == QLatin1String("transaction")) {
+        Transaction t;
+        if (deleted) ok = del(QStringLiteral("DELETE FROM receipts WHERE transaction_id = ?")) && del(QStringLiteral("DELETE FROM transactions WHERE id = ?"));
+        else ok = json::to(data, &t) && writeTransaction(t);
+    } else if (entity == QLatin1String("recurring")) {
+        Recurring r;
+        ok = deleted ? del(QStringLiteral("DELETE FROM recurring WHERE id = ?")) : (json::to(data, &r) && writeRecurring(r));
+    } else if (entity == QLatin1String("account")) {
+        Account a;
+        ok = deleted ? del(QStringLiteral("DELETE FROM accounts WHERE id = ?")) : (json::to(data, &a) && writeAccount(a));
+    } else if (entity == QLatin1String("rule")) {
+        ImportRule r;
+        ok = deleted ? del(QStringLiteral("DELETE FROM import_rules WHERE id = ?")) : (json::to(data, &r) && writeImportRule(r));
+    } else if (entity == QLatin1String("receipt")) {
+        if (deleted) {
+            ok = del(QStringLiteral("DELETE FROM receipts WHERE id = ?"));
+        } else {
+            Receipt r;
+            if (!json::receiptFromMeta(data, &r)) return ApplyResult::Skipped;
+            if (!loadReceipt || !loadReceipt(&r.data)) return ApplyResult::NotReady;
+            r.size = r.data.size();
+            ok = writeReceipt(r);
+        }
+    } else {
+        return ApplyResult::Skipped; // unknown kind from a newer version
+    }
+    if (!ok) return ApplyResult::Skipped;
+    QSqlQuery v(m_db);
+    v.prepare(QStringLiteral("INSERT OR REPLACE INTO sync_versions(entity, id, ts, device) VALUES(?,?,?,?)"));
+    v.addBindValue(entity);
+    v.addBindValue(id);
+    v.addBindValue(ts);
+    v.addBindValue(device);
+    v.exec();
+    return ApplyResult::Applied;
+}
+
+bool Store::wipeForJoin(QString *error)
+{
+    const bool tracking = m_tracking;
+    m_tracking = false;
+    m_db.transaction();
+    const bool ok = clearTables() && exec(QStringLiteral("DELETE FROM sync_outbox")) && exec(QStringLiteral("DELETE FROM sync_versions")) &&
+                    exec(QStringLiteral("DELETE FROM sync_files"));
+    if (!ok || !m_db.commit()) {
+        if (error) *error = m_db.lastError().text();
+        m_db.rollback();
+        m_tracking = tracking;
+        return false;
+    }
+    m_tracking = tracking;
+    m_autoPosted.clear();
+    loadCache();
+    emit dataChanged();
+    return true;
+}
+
+QJsonObject Store::syncConfig() const
+{
+    return QJsonDocument::fromJson(localValue(QStringLiteral("sync")).toUtf8()).object();
+}
+
+void Store::setSyncConfig(const QJsonObject &cfg)
+{
+    setLocalValue(QStringLiteral("sync"), cfg.isEmpty() ? QString() : QString::fromUtf8(QJsonDocument(cfg).toJson(QJsonDocument::Compact)));
+    m_tracking = !cfg.value(QStringLiteral("folder")).toString().isEmpty();
+}
+
+bool Store::isFileApplied(const QString &name) const
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT 1 FROM sync_files WHERE name = ?"));
+    q.addBindValue(name);
+    return q.exec() && q.next();
+}
+
+void Store::markFileApplied(const QString &name)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR IGNORE INTO sync_files(name) VALUES(?)"));
+    q.addBindValue(name);
+    q.exec();
 }

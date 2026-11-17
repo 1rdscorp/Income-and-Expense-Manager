@@ -4,6 +4,9 @@
 #include "CategoriesPage.h"
 #include "DashboardPage.h"
 #include "RecurringPage.h"
+#include "BankPage.h"
+#include "core/BankImport.h"
+#include "core/Sync.h"
 #include "ReportsPage.h"
 #include "SettingsPage.h"
 #include "Theme.h"
@@ -20,6 +23,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QListWidget>
+#include <QLocale>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
@@ -36,8 +40,8 @@ struct NavItem {
     const char *icon;
 };
 const NavItem kNav[] = {
-    {"Dashboard", "dashboard"}, {"Transactions", "list"}, {"Categories", "tag"}, {"Recurring", "repeat"},
-    {"Reports", "chart"},       {"Backup & Restore", "database"}, {"Settings", "settings"},
+    {"Dashboard", "dashboard"}, {"Transactions", "list"}, {"Categories", "tag"}, {"Recurring", "repeat"}, {"Bank & Cards", "card"},
+    {"Reports", "chart"},       {"Backup & Sync", "database"}, {"Settings", "settings"},
 };
 
 QSettings windowSettings()
@@ -133,14 +137,16 @@ MainWindow::MainWindow(QWidget *parent)
     m_transactions = new TransactionsPage;
     m_categories = new CategoriesPage;
     m_recurring = new RecurringPage;
+    m_bank = new BankPage;
     m_reports = new ReportsPage;
     m_backup = new BackupPage;
     m_settings = new SettingsPage;
-    m_pages = {m_dashboard, m_transactions, m_categories, m_recurring, m_reports, m_backup, m_settings};
+    m_pages = {m_dashboard, m_transactions, m_categories, m_recurring, m_bank, m_reports, m_backup, m_settings};
     m_stack->addWidget(scrollWrap(m_dashboard));
     m_stack->addWidget(m_transactions);
     m_stack->addWidget(m_categories);
     m_stack->addWidget(m_recurring);
+    m_stack->addWidget(scrollWrap(m_bank));
     m_stack->addWidget(scrollWrap(m_reports));
     m_stack->addWidget(scrollWrap(m_backup));
     m_stack->addWidget(scrollWrap(m_settings));
@@ -183,8 +189,31 @@ MainWindow::MainWindow(QWidget *parent)
     // Record recurring payments as they fall due while the app stays open (e.g. overnight).
     auto *recurTimer = new QTimer(this);
     recurTimer->setInterval(5 * 60 * 1000);
-    connect(recurTimer, &QTimer::timeout, this, []() { Store::instance().processRecurring(); });
+    connect(recurTimer, &QTimer::timeout, this, [this]() {
+        if (sync::isConnected(Store::instance())) runSync(); // imports other computers' changes first
+        else Store::instance().processRecurring();
+    });
     recurTimer->start();
+
+    // Shared folder: share local changes shortly after they're made, and check for others' every 2 minutes.
+    m_syncDebounce = new QTimer(this);
+    m_syncDebounce->setSingleShot(true);
+    m_syncDebounce->setInterval(10 * 1000);
+    connect(m_syncDebounce, &QTimer::timeout, this, &MainWindow::runSync);
+    connect(&Store::instance(), &Store::dataChanged, this, [this]() {
+        if (!m_syncing && sync::isConnected(Store::instance()) && Store::instance().pendingChangeCount() > 0) m_syncDebounce->start();
+    });
+    auto *syncTimer = new QTimer(this);
+    syncTimer->setInterval(2 * 60 * 1000);
+    connect(syncTimer, &QTimer::timeout, this, &MainWindow::runSync);
+    syncTimer->start();
+
+    // Watched statement folders
+    auto *importTimer = new QTimer(this);
+    importTimer->setInterval(60 * 1000);
+    connect(importTimer, &QTimer::timeout, this, &MainWindow::runAutoImport);
+    importTimer->start();
+    QTimer::singleShot(3000, this, &MainWindow::runAutoImport);
 
     QSettings ws = windowSettings();
     if (!restoreGeometry(ws.value(QStringLiteral("geometry")).toByteArray())) resize(1320, 860);
@@ -258,8 +287,18 @@ void MainWindow::refreshChrome()
     m_brandName->setToolTip(s.settings().businessName);
     const QString last = s.settings().lastBackupAt;
     const QString dot = s.backupIsStale() ? QStringLiteral("#fab219") : QStringLiteral("#0ca30c");
-    m_foot->setText(QStringLiteral("<span style='color:%1'>●</span> %2<br>Data is stored on this computer.")
-                        .arg(dot, last.isEmpty() ? QStringLiteral("No backup yet") : QStringLiteral("Last backup %1").arg(util::fmtDateTime(last))));
+    QString syncLine;
+    if (sync::isConnected(s)) {
+        const QString err = sync::lastError(s);
+        const QDateTime ls = sync::lastSync(s);
+        syncLine = err.isEmpty() ? QStringLiteral("<span style='color:#6da7ec'>⟳</span> Shared folder · synced %1")
+                                       .arg(ls.isValid() ? QLocale().toString(ls.toLocalTime(), QStringLiteral("HH:mm")) : QStringLiteral("—"))
+                                 : QStringLiteral("<span style='color:#fab219'>⚠</span> Shared folder not available");
+    } else {
+        syncLine = QStringLiteral("Data is stored on this computer.");
+    }
+    m_foot->setText(QStringLiteral("<span style='color:%1'>●</span> %2<br>%3")
+                        .arg(dot, last.isEmpty() ? QStringLiteral("No backup yet") : QStringLiteral("Last backup %1").arg(util::fmtDateTime(last)), syncLine));
     setWindowTitle(QStringLiteral("%1 — Ledgerly").arg(s.settings().businessName));
 }
 
@@ -310,8 +349,33 @@ void MainWindow::openTransactionDialog(const QString &editId, bool duplicate)
     }
 }
 
+void MainWindow::runSync()
+{
+    Store &s = Store::instance();
+    if (m_syncing || !sync::isConnected(s)) return;
+    m_syncing = true;
+    sync::syncNow(s);
+    m_syncing = false;
+    refreshChrome();
+}
+
+void MainWindow::runAutoImport()
+{
+    const auto results = bank::runAutoImport(Store::instance());
+    for (const auto &r : results) {
+        if (!r.error.isEmpty())
+            Store::instance().addNotice(QStringLiteral("Couldn't import statement “%1”: %2").arg(r.file, r.error));
+        else if (r.imported > 0)
+            Store::instance().addNotice(QStringLiteral("%1 transaction%2 imported from “%3”%4")
+                                            .arg(r.imported)
+                                            .arg(r.imported == 1 ? QString() : QStringLiteral("s"), r.file,
+                                                 r.skipped ? QStringLiteral(" (%1 skipped as duplicates)").arg(r.skipped) : QString()));
+    }
+}
+
 void MainWindow::closeEvent(QCloseEvent *e)
 {
+    if (sync::isConnected(Store::instance()) && Store::instance().pendingChangeCount() > 0) sync::syncNow(Store::instance());
     Store &s = Store::instance();
     const ::Settings &st = s.settings();
     if (!st.autoBackupDir.isEmpty() && s.dirtySinceOpen()) {

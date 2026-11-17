@@ -68,6 +68,7 @@ DashboardPage::DashboardPage(QWidget *parent)
     connect(abView, &QPushButton::clicked, this, [this]() { emit requestPage(MainWindow::Transactions); });
     connect(abDismiss, &QPushButton::clicked, this, [this]() {
         Store::instance().clearAutoPosted();
+        Store::instance().clearNotices();
         refresh();
     });
     root->addWidget(m_autoBanner);
@@ -236,7 +237,14 @@ void DashboardPage::refresh()
                                               : QStringLiteral("Your last backup was on %1.").arg(util::fmtDateTime(last))));
 
     const auto &autoPosted = s.autoPosted();
-    m_autoBanner->setVisible(!autoPosted.isEmpty());
+    const QStringList notices = s.notices();
+    m_autoBanner->setVisible(!autoPosted.isEmpty() || !notices.isEmpty());
+    if (autoPosted.isEmpty() && !notices.isEmpty()) {
+        if (auto *ic = m_autoBanner->findChild<QLabel *>(QStringLiteral("autoIcon"))) ic->setPixmap(Theme::iconPixmap(QStringLiteral("bank"), t.accent, 20));
+        QStringList esc;
+        for (const auto &n : notices) esc << n.toHtmlEscaped();
+        m_autoText->setText(esc.join(QStringLiteral("<br>")));
+    }
     if (!autoPosted.isEmpty()) {
         if (auto *ic = m_autoBanner->findChild<QLabel *>(QStringLiteral("autoIcon"))) ic->setPixmap(Theme::iconPixmap(QStringLiteral("repeat"), t.accent, 20));
         QStringList items;
@@ -250,9 +258,11 @@ void DashboardPage::refresh()
             }
         }
         if (autoPosted.size() > 3) items << QStringLiteral("%1 more").arg(autoPosted.size() - 3);
-        m_autoText->setText(QStringLiteral("<b>%1 recurring payment%2 recorded automatically:</b> %3")
-                                .arg(autoPosted.size())
-                                .arg(autoPosted.size() == 1 ? QString() : QStringLiteral("s"), items.join(QStringLiteral(", "))));
+        QString text = QStringLiteral("<b>%1 recurring payment%2 recorded automatically:</b> %3")
+                           .arg(autoPosted.size())
+                           .arg(autoPosted.size() == 1 ? QString() : QStringLiteral("s"), items.join(QStringLiteral(", ")));
+        for (const auto &n : notices) text += QStringLiteral("<br>") + n.toHtmlEscaped();
+        m_autoText->setText(text);
     }
 
     const bool empty = s.transactions().isEmpty();

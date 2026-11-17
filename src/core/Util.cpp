@@ -18,6 +18,12 @@ const QChar kMinus(0x2212);
 
 QString newId() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
 
+QString stableId(const QString &key)
+{
+    static const QUuid ns(QStringLiteral("{6f1c4f8e-2d3a-4b7c-9a51-0e7f2c1d8b44}"));
+    return QUuid::createUuidV5(ns, key).toString(QUuid::WithoutBraces);
+}
+
 QString nowIso() { return QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs); }
 
 void setCurrency(const QString &code)

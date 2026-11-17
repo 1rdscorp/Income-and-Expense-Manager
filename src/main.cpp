@@ -1,4 +1,6 @@
+#include "core/BankImport.h"
 #include "core/Store.h"
+#include "core/Sync.h"
 #include "ui/MainWindow.h"
 #include "ui/Theme.h"
 
@@ -38,8 +40,10 @@ int main(int argc, char *argv[])
         return 1;
     }
     Theme::instance().apply(Store::instance().settings().theme);
-    // Record recurring payments that fell due while the app was closed.
-    Store::instance().processRecurring();
+    // Get other computers' changes first (shared folder), then record recurring payments
+    // that fell due while the app was closed.
+    if (sync::isConnected(Store::instance())) sync::syncNow(Store::instance());
+    else Store::instance().processRecurring();
 
     MainWindow w;
     w.show();
@@ -48,7 +52,7 @@ int main(int argc, char *argv[])
         const QString dir = parser.value(shotOpt);
         QDir().mkpath(dir);
         QTimer::singleShot(400, &w, [&w, dir]() {
-            const char *names[] = {"dashboard", "transactions", "categories", "recurring", "reports", "backup", "settings"};
+            const char *names[] = {"dashboard", "transactions", "categories", "recurring", "bank", "reports", "backup", "settings"};
             for (int i = 0; i < MainWindow::PageCount; ++i) {
                 w.showPage(i);
                 QApplication::processEvents();

@@ -61,6 +61,8 @@ struct Transaction {
     QString createdAt;
     QString updatedAt;
     QString recurringId; // set when created by a recurring rule
+    QString accountId;   // bank account / card it was imported from
+    QString externalId;  // bank's transaction id (or a fingerprint) to skip duplicates on re-import
 
     qint64 signedAmount() const { return type == TxType::Income ? amount : -amount; }
 };
@@ -87,6 +89,28 @@ struct Recurring {
 
     bool finished() const { return endDate.isValid() && nextDate.isValid() && nextDate > endDate; }
     QString title() const { return !description.isEmpty() ? description : vendor; }
+};
+
+/* A bank account or credit card that statements are imported from. */
+struct Account {
+    QString id;
+    QString name;
+    QString kind = QStringLiteral("bank"); // bank | card
+    bool flipSigns = false;                // statements show money going out as positive numbers
+    QString csvMapping;                    // remembered CSV column mapping (JSON)
+    QString createdAt;
+    QString updatedAt;
+    bool isCard() const { return kind == QLatin1String("card"); }
+};
+
+/* "When the bank description contains <pattern>, use <category>" (or ignore the line). */
+struct ImportRule {
+    QString id;
+    QString pattern;
+    QString categoryId;
+    bool ignore = false; // e.g. card payments / transfers between own accounts
+    QString createdAt;
+    QString updatedAt;
 };
 
 struct Receipt {
@@ -131,6 +155,8 @@ struct BackupData {
     QVector<Transaction> transactions;
     QVector<Receipt> receipts;
     QVector<Recurring> recurring;
+    QVector<Account> accounts;
+    QVector<ImportRule> importRules;
     QString exportedAt;
 };
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(Ledgerly
-    VERSION 1.2.0
+    VERSION 1.3.0
     DESCRIPTION "Income & Expense Manager for small businesses"
     HOMEPAGE_URL "https://github.com/1rdscorp/Income-and-Expense-Manager"
     LANGUAGES CXX)
@@ -27,11 +27,14 @@ add_library(ledgerly_core STATIC
     src/core/Models.h
     src/core/Util.h src/core/Util.cpp
     src/core/Defaults.h src/core/Defaults.cpp
+    src/core/Json.h src/core/Json.cpp
     src/core/Recurrence.h src/core/Recurrence.cpp
     src/core/Store.h src/core/Store.cpp
     src/core/Backup.h src/core/Backup.cpp
     src/core/Reports.h src/core/Reports.cpp
     src/core/Xlsx.h src/core/Xlsx.cpp
+    src/core/Sync.h src/core/Sync.cpp
+    src/core/BankImport.h src/core/BankImport.cpp
 )
 target_include_directories(ledgerly_core PUBLIC src)
 target_link_libraries(ledgerly_core PUBLIC Qt6::Core Qt6::Sql)
@@ -53,6 +56,9 @@ add_library(ledgerly_ui STATIC
     src/ui/CategoryDialog.h src/ui/CategoryDialog.cpp
     src/ui/RecurringPage.h src/ui/RecurringPage.cpp
     src/ui/RecurringDialog.h src/ui/RecurringDialog.cpp
+    src/ui/BankPage.h src/ui/BankPage.cpp
+    src/ui/BankDialogs.h src/ui/BankDialogs.cpp
+    src/ui/ImportDialog.h src/ui/ImportDialog.cpp
     src/ui/ReceiptViewer.h src/ui/ReceiptViewer.cpp
 )
 target_link_libraries(ledgerly_ui PUBLIC ledgerly_core Qt6::Widgets Qt6::Svg Qt6::PrintSupport)

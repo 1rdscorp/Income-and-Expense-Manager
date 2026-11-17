@@ -10,6 +10,8 @@ class DashboardPage;
 class TransactionsPage;
 class CategoriesPage;
 class RecurringPage;
+class BankPage;
+class QTimer;
 class ReportsPage;
 class BackupPage;
 class SettingsPage;
@@ -18,7 +20,7 @@ class MainWindow : public QMainWindow
 {
     Q_OBJECT
 public:
-    enum PageId { Dashboard, Transactions, Categories, Recurring, Reports, Backup, Settings, PageCount };
+    enum PageId { Dashboard, Transactions, Categories, Recurring, Bank, Reports, Backup, Settings, PageCount };
 
     explicit MainWindow(QWidget *parent = nullptr);
 
@@ -40,6 +42,8 @@ private:
     void refreshChrome();
     void refreshIcons();
     void openTransactionDialog(const QString &editId, bool duplicate);
+    void runSync();
+    void runAutoImport();
 
     QListWidget *m_nav = nullptr;
     QStackedWidget *m_stack = nullptr;
@@ -53,6 +57,9 @@ private:
     TransactionsPage *m_transactions = nullptr;
     CategoriesPage *m_categories = nullptr;
     RecurringPage *m_recurring = nullptr;
+    BankPage *m_bank = nullptr;
+    QTimer *m_syncDebounce = nullptr;
+    bool m_syncing = false;
     ReportsPage *m_reports = nullptr;
     BackupPage *m_backup = nullptr;
     SettingsPage *m_settings = nullptr;

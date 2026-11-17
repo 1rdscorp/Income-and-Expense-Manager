@@ -1,8 +1,10 @@
 #include "core/Backup.h"
+#include "core/BankImport.h"
 #include "core/Defaults.h"
 #include "core/Recurrence.h"
 #include "core/Reports.h"
 #include "core/Store.h"
+#include "core/Sync.h"
 #include "core/Util.h"
 #include "core/Xlsx.h"
 
@@ -428,6 +430,323 @@ private slots:
         QFile c(dir.filePath(QStringLiteral("t.csv")));
         QVERIFY(c.open(QIODevice::ReadOnly));
         QVERIFY(c.readAll().contains("Date,Type,Category"));
+    }
+
+
+
+    void bankStatementParsing()
+    {
+        const QByteArray ofx =
+            "OFXHEADER:100\nDATA:OFXSGML\nVERSION:102\nCHARSET:1252\n\n<OFX><CREDITCARDMSGSRSV1><CCSTMTTRNRS><CCSTMTRS>"
+            "<CCACCTFROM><ACCTID>4111XXXXXXXX1234</CCACCTFROM><BANKTRANLIST>"
+            "<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20261103120000[-5:EST]<TRNAMT>-15.99<FITID>A1<NAME>NETFLIX.COM<MEMO>Monthly plan</STMTTRN>"
+            "<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20261104<TRNAMT>-42.10<FITID>A2<NAME>SHELL OIL 57444<MEMO></STMTTRN>"
+            "<STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20261105<TRNAMT>500.00<FITID>A3<NAME>PAYMENT THANK YOU</STMTTRN>"
+            "</BANKTRANLIST></CCSTMTRS></CCSTMTTRNRS></CREDITCARDMSGSRSV1></OFX>";
+        auto r = bank::parseData(ofx, QStringLiteral("stmt.qfx"));
+        QVERIFY2(r.ok(), qPrintable(r.error));
+        QCOMPARE(r.format, QStringLiteral("OFX"));
+        QVERIFY(r.looksLikeCard);
+        QCOMPARE(r.lines.size(), 3);
+        QCOMPARE(r.lines[0].date, QDate(2026, 11, 3));
+        QCOMPARE(r.lines[0].amount, -1599);
+        QCOMPARE(r.lines[0].externalId, QStringLiteral("ofx:A1"));
+        QCOMPARE(r.lines[0].memo, QStringLiteral("Monthly plan"));
+        QCOMPARE(r.lines[2].amount, 50000);
+
+        const QByteArray qif = "!Type:Bank\nD11/03/2026\nT-1,250.00\nPOAKVIEW PROPERTIES\nMRent November\n^\nD11/04'26\nT3200\nPCLIENT ABC\n^\n";
+        r = bank::parseData(qif, QStringLiteral("x.qif"));
+        QVERIFY2(r.ok(), qPrintable(r.error));
+        QCOMPARE(r.lines.size(), 2);
+        QCOMPARE(r.lines[0].amount, -125000);
+        QCOMPARE(r.lines[1].amount, 320000);
+        QCOMPARE(r.lines[0].date, QDate(2026, 11, 3));
+        QCOMPARE(r.lines[1].date, QDate(2026, 11, 4));
+        QVERIFY(!r.lines[0].externalId.isEmpty()); // fingerprint
+
+        // Plain CSV with a signed amount and a preamble line
+        const QByteArray csv1 = "Account: Business Checking ****1234\nDate,Description,Amount,Balance\n2026-11-01,\"ACME WHOLESALE, INC\",-1200.50,800.00\n"
+                                "2026-11-02,CLIENT PAYMENT,2000,2800.00\n2026-11-02,CLIENT PAYMENT,2000,4800.00\n";
+        r = bank::parseData(csv1, QStringLiteral("a.csv"));
+        QVERIFY2(r.ok(), qPrintable(r.error));
+        QCOMPARE(r.lines.size(), 3);
+        QCOMPARE(r.lines[0].description, QStringLiteral("ACME WHOLESALE, INC"));
+        QCOMPARE(r.lines[0].amount, -120050);
+        QVERIFY(r.lines[1].externalId != r.lines[2].externalId); // identical lines stay distinct
+        QCOMPARE(r.csvMapping.dateFormat, QStringLiteral("yyyy-MM-dd"));
+
+        // European CSV: semicolons, decimal commas, debit/credit columns, day-first dates
+        const QByteArray csv2 = "Datum;Booking date;Details;Money out;Money in\n;13/11/2026;Coffee Shop;4,50;\n;14/11/2026;Invoice 77;;1.250,00\n";
+        r = bank::parseData(csv2, QStringLiteral("b.csv"));
+        QVERIFY2(r.ok(), qPrintable(r.error));
+        QCOMPARE(r.csvMapping.delimiter, QLatin1Char(';'));
+        QCOMPARE(r.lines.size(), 2);
+        QCOMPARE(r.lines[0].date, QDate(2026, 11, 13));
+        QCOMPARE(r.lines[0].amount, -450);
+        QCOMPARE(r.lines[1].amount, 125000);
+
+        // Mapping survives a JSON round trip (remembered per account)
+        const bank::CsvMapping m = bank::CsvMapping::fromJson(r.csvMapping.toJson());
+        QCOMPARE(m.debit, r.csvMapping.debit);
+        QCOMPARE(m.dateFormat, r.csvMapping.dateFormat);
+
+        bool ok = false;
+        QCOMPARE(bank::parseSignedAmount(QStringLiteral("(1,234.56)"), &ok), -123456);
+        QCOMPARE(bank::parseSignedAmount(QStringLiteral("$12.00 DR"), &ok), -1200);
+
+        QCOMPARE(bank::cleanDescription(QStringLiteral("POS 4421 NETFLIX.COM 866-579-7172 CA")), QStringLiteral("Netflix.com"));
+        QCOMPARE(bank::cleanDescription(QStringLiteral("CARD PURCHASE SHELL OIL 57444")), QStringLiteral("Shell Oil"));
+        QCOMPARE(bank::payeeKey(QStringLiteral("SHELL OIL 12345 HOUSTON")), bank::payeeKey(QStringLiteral("Shell Oil 99881")));
+    }
+
+    void bankImportCategoriesAndDuplicates()
+    {
+        Store &s = store();
+        QString err, accId;
+        bank::CsvMapping none;
+        Account card;
+        card.name = QStringLiteral("Business Visa");
+        card.kind = QStringLiteral("card");
+        QVERIFY2(s.saveAccount(card, &err, &accId), qPrintable(err));
+        card = *s.account(accId);
+        Account dup = card;
+        dup.id.clear();
+        QVERIFY(!s.saveAccount(dup, &err)); // name taken
+
+        // A manual transaction that the statement also contains
+        Transaction manual;
+        manual.categoryId = catId(QStringLiteral("Vehicle & Fuel"));
+        manual.amount = 4210;
+        manual.date = QDate(2026, 11, 5);
+        manual.description = QStringLiteral("Fuel");
+        QVERIFY(s.saveTransaction(manual, {}, {}, &err));
+
+        ImportRule ignore;
+        ignore.pattern = QStringLiteral("PAYMENT THANK YOU");
+        ignore.ignore = true;
+        QVERIFY(s.saveImportRule(ignore, &err));
+        ImportRule rule;
+        rule.pattern = QStringLiteral("acme");
+        rule.categoryId = catId(QStringLiteral("Cost of Goods / Inventory"));
+        QVERIFY(s.saveImportRule(rule, &err));
+
+        QVector<bank::StatementLine> lines;
+        auto line = [&](int d, qint64 amt, const char *desc, const char *id) {
+            bank::StatementLine l;
+            l.date = QDate(2026, 11, d);
+            l.amount = amt;
+            l.description = QString::fromUtf8(desc);
+            l.externalId = QString::fromUtf8(id);
+            lines << l;
+        };
+        line(3, -1599, "NETFLIX.COM", "ofx:A1");
+        line(4, -4210, "SHELL OIL 57444", "ofx:A2");
+        line(5, 50000, "PAYMENT THANK YOU", "ofx:A3");
+        line(6, -99900, "ACME WHOLESALE INC", "ofx:A4");
+        line(7, -2300, "SOMEWHERE UNKNOWN", "ofx:A5");
+
+        auto items = bank::prepare(s, card, lines);
+        QCOMPARE(items.size(), 5);
+        QCOMPARE(items[0].status, bank::Proposed::Status::New);
+        QCOMPARE(items[0].tx.categoryId, catId(QStringLiteral("Software & Subscriptions"))); // keyword
+        QCOMPARE(items[0].tx.type, TxType::Expense);
+        QCOMPARE(items[0].tx.description, QStringLiteral("Netflix.com"));
+        QCOMPARE(items[1].status, bank::Proposed::Status::PossibleDuplicate); // matches the manual fuel entry
+        QVERIFY(!items[1].include);
+        QCOMPARE(items[2].status, bank::Proposed::Status::Ignored);
+        QCOMPARE(items[3].tx.categoryId, catId(QStringLiteral("Cost of Goods / Inventory"))); // rule
+        QCOMPARE(items[4].tx.categoryId, catId(QStringLiteral("Miscellaneous")));            // default
+
+        // You fix the unknown one; next time it's learned from history
+        items[4].tx.categoryId = catId(QStringLiteral("Repairs & Maintenance"));
+        QCOMPARE(bank::commit(s, items, &err), 3);
+        QCOMPARE(s.accountTransactionCount(accId), 3);
+        QVERIFY(s.alreadyImported(accId, QStringLiteral("ofx:A1")));
+
+        // Re-importing the same statement adds nothing
+        items = bank::prepare(s, card, lines);
+        int fresh = 0;
+        for (const auto &p : items)
+            if (p.include) ++fresh;
+        QCOMPARE(fresh, 0);
+        QCOMPARE(items[0].status, bank::Proposed::Status::Duplicate);
+
+        // Learning: a new line from the same payee gets the category you chose
+        lines.clear();
+        line(20, -1800, "SOMEWHERE UNKNOWN 99812", "ofx:B1");
+        items = bank::prepare(s, card, lines);
+        QCOMPARE(items[0].tx.categoryId, catId(QStringLiteral("Repairs & Maintenance")));
+
+        // Flip signs (card statements that show charges as positive)
+        card.flipSigns = true;
+        lines.clear();
+        line(21, 2500, "UBER TRIP 0042", "ofx:C1");
+        items = bank::prepare(s, card, lines);
+        QCOMPARE(items[0].tx.type, TxType::Expense);
+        QCOMPARE(items[0].tx.categoryId, catId(QStringLiteral("Travel")));
+
+        // Deleting the account keeps its transactions
+        QVERIFY(s.deleteAccount(accId, &err));
+        QCOMPARE(s.accountTransactionCount(accId), 0);
+        QVERIFY(s.transactions().size() > 3);
+    }
+
+    void bankAutoImportFolder()
+    {
+        Store &s = store();
+        QString err, accId;
+        Account bankAcc;
+        bankAcc.name = QStringLiteral("Checking");
+        QVERIFY(s.saveAccount(bankAcc, &err, &accId));
+        QTemporaryDir watch;
+        bank::setWatchFolder(s, accId, watch.path());
+        QCOMPARE(bank::watchFolder(s, accId), watch.path());
+        const QString file = watch.filePath(QStringLiteral("nov.csv"));
+        {
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("Date,Description,Amount\n2026-11-12,ELECTRIC CO,-180.25\n2026-11-13,CUSTOMER DEPOSIT,950.00\n");
+            f.close();
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QVERIFY(f.setFileTime(QDateTime::currentDateTime().addSecs(-120), QFileDevice::FileModificationTime));
+        }
+        const auto results = bank::runAutoImport(s);
+        QCOMPARE(results.size(), 1);
+        QCOMPARE(results[0].imported, 2);
+        QVERIFY(!QFile::exists(file));
+        QVERIFY(QFile::exists(watch.filePath(QStringLiteral("Imported/nov.csv"))));
+        QCOMPARE(s.accountTransactionCount(accId), 2);
+        QVERIFY(bank::runAutoImport(s).isEmpty()); // nothing left
+    }
+
+    void sharedFolderSync()
+    {
+        Store &s = store();
+        const QString mainDir = s.dataDir();
+        QTemporaryDir shared, dirA, dirB, dirC;
+        QString err;
+        auto find = [&](const QString &desc) -> const Transaction * {
+            for (const auto &t : s.transactions())
+                if (t.description == desc) return &t;
+            return nullptr;
+        };
+        auto addTx = [&](const QString &desc, qint64 amount, const QString &cat, const QVector<Receipt> &rec = {}) {
+            Transaction t;
+            t.categoryId = catId(cat);
+            t.amount = amount;
+            t.date = QDate(2026, 11, 10);
+            t.description = desc;
+            QVERIFY2(s.saveTransaction(t, rec, {}, &err), qPrintable(err));
+        };
+
+        // ---- Computer A creates the shared folder ----
+        QVERIFY(s.open(dirA.path(), &err));
+        const QString deviceA = s.deviceId();
+        Receipt rc;
+        rc.name = QStringLiteral("rent.pdf");
+        rc.mime = QStringLiteral("application/pdf");
+        rc.data = QByteArray("%PDF-1.4 fake receipt");
+        addTx(QStringLiteral("Rent A"), 180000, QStringLiteral("Rent & Lease"), {rc});
+        addTx(QStringLiteral("Paper A"), 2500, QStringLiteral("Office Supplies"));
+        Settings st = s.settings();
+        st.businessName = QStringLiteral("Shared Biz");
+        s.saveSettings(st);
+        QVERIFY(!sync::inspect(shared.path()).hasLedger);
+        QVERIFY2(sync::connect(s, shared.path(), sync::JoinMode::Create, &err), qPrintable(err));
+        QVERIFY(sync::isConnected(s));
+        QVERIFY(QFile::exists(shared.filePath(QStringLiteral("ledgerly-shared.json"))));
+        QCOMPARE(s.pendingChangeCount(), 0);
+        QVERIFY(QDir(shared.filePath(QStringLiteral("changes/") + deviceA)).entryList({QStringLiteral("*.json")}).size() >= 1);
+
+        // ---- Computer B joins, replacing its own (default) data ----
+        QVERIFY(s.open(dirB.path(), &err));
+        QVERIFY(s.deviceId() != deviceA);
+        addTx(QStringLiteral("Local B"), 999, QStringLiteral("Travel"));
+        const sync::FolderInfo info = sync::inspect(shared.path());
+        QVERIFY(info.hasLedger);
+        QVERIFY2(sync::connect(s, shared.path(), sync::JoinMode::Replace, &err), qPrintable(err));
+        QVERIFY(!find(QStringLiteral("Local B")));
+        QVERIFY(find(QStringLiteral("Rent A")));
+        QCOMPARE(s.settings().businessName, QStringLiteral("Shared Biz"));
+        QCOMPARE(s.categories().size(), defaults::categories().size()); // same default ids -> no duplicates
+        const auto receipts = s.receiptsFor(find(QStringLiteral("Rent A"))->id);
+        QCOMPARE(receipts.size(), 1);
+        QCOMPARE(receipts[0].data, QByteArray("%PDF-1.4 fake receipt"));
+
+        // B edits, adds and deletes
+        Transaction rent = *find(QStringLiteral("Rent A"));
+        rent.amount = 190000;
+        QVERIFY(s.saveTransaction(rent, {}, {}, &err));
+        addTx(QStringLiteral("From B"), 4200, QStringLiteral("Utilities"));
+        QVERIFY(s.deleteTransactions({find(QStringLiteral("Paper A"))->id}, &err));
+        Recurring net;
+        net.categoryId = catId(QStringLiteral("Telephone & Internet"));
+        net.amount = 8900;
+        net.description = QStringLiteral("Internet");
+        net.startDate = QDate::currentDate().addMonths(-2);
+        QVERIFY(s.saveRecurring(net, &err));
+        const int netPosted = s.recurringPostedCount(s.recurring().first().id);
+        QVERIFY(netPosted >= 3);
+        sync::Result r = sync::syncNow(s);
+        QVERIFY2(r.ok, qPrintable(r.error));
+        QVERIFY(r.exported > 0);
+
+        // ---- Back on A: B's changes arrive ----
+        QVERIFY(s.open(dirA.path(), &err));
+        QCOMPARE(s.deviceId(), deviceA);
+        r = sync::syncNow(s);
+        QVERIFY2(r.ok, qPrintable(r.error));
+        QVERIFY(r.imported > 0);
+        QCOMPARE(find(QStringLiteral("Rent A"))->amount, 190000);
+        QVERIFY(find(QStringLiteral("From B")));
+        QVERIFY(!find(QStringLiteral("Paper A")));
+        QCOMPARE(s.recurring().size(), 1);
+        const QString ruleId = s.recurring().first().id;
+        QCOMPARE(s.recurringPostedCount(ruleId), netPosted); // A didn't post the same payments again
+        QVERIFY(sync::computers(s).size() == 1);
+
+        // Both computers record the next payment independently -> still one transaction
+        const QDate future = s.recurringRule(ruleId)->nextDate;
+        QCOMPARE(s.processRecurring(future).size(), 1);
+        rent = *find(QStringLiteral("Rent A"));
+        rent.description = QStringLiteral("Rent A (edited on A)");
+        QVERIFY(s.saveTransaction(rent, {}, {}, &err));
+        QVERIFY(sync::syncNow(s).ok);
+
+        QVERIFY(s.open(dirB.path(), &err));
+        QCOMPARE(s.processRecurring(future).size(), 1); // B hasn't seen A's yet
+        QTest::qWait(5);
+        rent = *find(QStringLiteral("Rent A"));
+        rent.description = QStringLiteral("Rent A (edited on B, later)");
+        QVERIFY(s.saveTransaction(rent, {}, {}, &err));
+        QVERIFY(sync::syncNow(s).ok);
+        QCOMPARE(s.recurringPostedCount(ruleId), netPosted + 1);
+        QVERIFY(find(QStringLiteral("Rent A (edited on B, later)")));
+
+        QVERIFY(s.open(dirA.path(), &err));
+        QVERIFY(sync::syncNow(s).ok);
+        QCOMPARE(s.recurringPostedCount(ruleId), netPosted + 1);
+        QVERIFY(find(QStringLiteral("Rent A (edited on B, later)"))); // most recent edit wins
+        QVERIFY(!find(QStringLiteral("Rent A (edited on A)")));
+
+        // ---- Computer C merges its own data in ----
+        QVERIFY(s.open(dirC.path(), &err));
+        addTx(QStringLiteral("C's own sale"), 50000, QStringLiteral("Sales Revenue"));
+        QVERIFY2(sync::connect(s, shared.path(), sync::JoinMode::Merge, &err), qPrintable(err));
+        QVERIFY(find(QStringLiteral("C's own sale")));
+        QVERIFY(find(QStringLiteral("From B")));
+        QCOMPARE(s.categories().size(), defaults::categories().size());
+        QVERIFY(s.open(dirA.path(), &err));
+        QVERIFY(sync::syncNow(s).ok);
+        QVERIFY(find(QStringLiteral("C's own sale")));
+
+        // Disconnecting stops tracking; the local data stays
+        sync::disconnect(s);
+        QVERIFY(!sync::isConnected(s));
+        addTx(QStringLiteral("After disconnect"), 100, QStringLiteral("Travel"));
+        QCOMPARE(s.pendingChangeCount(), 0);
+
+        QVERIFY(s.open(mainDir, &err));
     }
 
     void sampleData()

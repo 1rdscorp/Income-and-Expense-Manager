@@ -8,6 +8,8 @@
 namespace util {
 
 QString newId();
+// Same input -> same id on every computer (used for default categories and recurring postings).
+QString stableId(const QString &key);
 QString nowIso();
 
 // Currency formatting (amounts are integer cents).

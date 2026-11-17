@@ -4,6 +4,7 @@
 #include "Widgets.h"
 #include "core/Backup.h"
 #include "core/Store.h"
+#include "core/Sync.h"
 #include "core/Util.h"
 
 #include <QApplication>
@@ -17,6 +18,8 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QRadioButton>
 #include <QSpinBox>
 #include <QStandardPaths>
@@ -39,6 +42,49 @@ BackupPage::BackupPage(QWidget *parent)
     m_banner->button()->setProperty("iconName", QStringLiteral("download"));
     connect(m_banner->button(), &QPushButton::clicked, this, [this]() { backupNow(true); });
     root->addWidget(m_banner);
+
+    // Shared folder (several computers)
+    auto *shared = new Card(QStringLiteral("Shared folder — use Ledgerly on several computers"));
+    m_syncStatus = new QLabel;
+    m_syncStatus->setWordWrap(true);
+    m_syncStatus->setTextFormat(Qt::RichText);
+    m_syncStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    shared->body()->addWidget(m_syncStatus);
+    auto *srow = new QHBoxLayout;
+    m_syncSetup = ui::button(QStringLiteral("Set up shared folder…"), QStringLiteral("cloud"), QStringLiteral("primary"));
+    m_syncNow = ui::button(QStringLiteral("Sync now"), QStringLiteral("refresh"));
+    m_syncOpen = ui::button(QStringLiteral("Open folder"), QStringLiteral("external"));
+    m_syncDisconnect = ui::button(QStringLiteral("Disconnect"), QStringLiteral("x"), QStringLiteral("dangerText"));
+    srow->addWidget(m_syncSetup);
+    srow->addWidget(m_syncNow);
+    srow->addWidget(m_syncOpen);
+    srow->addWidget(m_syncDisconnect);
+    srow->addStretch(1);
+    shared->body()->addLayout(srow);
+    shared->body()->addWidget(ui::muted(QStringLiteral(
+        "Pick a folder that is synced on every computer — e.g. “My Drive\\Ledgerly” in Google Drive for desktop, OneDrive or Dropbox. "
+        "Each computer keeps its own copy of the data; only changes go through the folder, so it is safe with cloud-sync tools. "
+        "Changes arrive on the other computers within a few minutes of the cloud service syncing them. Keep making backups too.")));
+    root->addWidget(shared);
+    connect(m_syncSetup, &QPushButton::clicked, this, &BackupPage::setupSharedFolder);
+    connect(m_syncNow, &QPushButton::clicked, this, [this]() {
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        const sync::Result r = sync::syncNow(Store::instance());
+        QApplication::restoreOverrideCursor();
+        if (!r.ok) QMessageBox::warning(this, QStringLiteral("Sync"), r.error);
+        refresh();
+    });
+    connect(m_syncOpen, &QPushButton::clicked, this, []() {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(sync::folder(Store::instance())));
+    });
+    connect(m_syncDisconnect, &QPushButton::clicked, this, [this]() {
+        if (QMessageBox::question(this, QStringLiteral("Disconnect shared folder"),
+                                  QStringLiteral("Stop sharing with the other computers?\n\nThis computer keeps all its data. The shared folder and "
+                                                 "the other computers are not changed. You can connect again later.")) != QMessageBox::Yes)
+            return;
+        sync::disconnect(Store::instance());
+        refresh();
+    });
 
     // Create
     auto *create = new Card(QStringLiteral("Create a backup"));
@@ -174,6 +220,29 @@ void BackupPage::refresh()
     m_autoDir->setText(QDir::toNativeSeparators(st.autoBackupDir));
     m_autoKeep->setValue(st.autoBackupKeep);
     m_autoOpen->setEnabled(!st.autoBackupDir.isEmpty());
+
+    // Shared folder status
+    const bool connected = sync::isConnected(s);
+    m_syncSetup->setVisible(!connected);
+    m_syncNow->setVisible(connected);
+    m_syncOpen->setVisible(connected);
+    m_syncDisconnect->setVisible(connected);
+    if (!connected) {
+        m_syncStatus->setText(QStringLiteral("<b>Not connected.</b> This computer's data is only on this computer."));
+    } else {
+        const QDateTime last = sync::lastSync(s);
+        const QString err = sync::lastError(s);
+        const QStringList others = sync::computers(s);
+        QString html = QStringLiteral("<b>Connected</b> to <code>%1</code><br>").arg(QDir::toNativeSeparators(sync::folder(s)).toHtmlEscaped());
+        html += err.isEmpty() ? QStringLiteral("Last synced %1").arg(last.isValid() ? util::fmtDateTime(last.toString(Qt::ISODateWithMs)) : QStringLiteral("never"))
+                              : ui::colorSpan(err, Theme::c().badText, true);
+        const int pending = s.pendingChangeCount();
+        if (pending) html += QStringLiteral(" · %1 change%2 waiting to be shared").arg(pending).arg(pending == 1 ? QString() : QStringLiteral("s"));
+        html += QStringLiteral("<br>This computer: <b>%1</b>").arg(sync::computerName().toHtmlEscaped());
+        html += others.isEmpty() ? QStringLiteral(" · no other computers yet — set up Ledgerly on another computer and choose this same folder.")
+                                 : QStringLiteral(" · also used by: %1").arg(others.join(QStringLiteral(", ")).toHtmlEscaped());
+        m_syncStatus->setText(html);
+    }
 }
 
 void BackupPage::saveAutoSettings()
@@ -265,9 +334,10 @@ void BackupPage::restore()
     if (m_replace->isChecked()) {
         const auto r = QMessageBox::warning(this, QStringLiteral("Replace all data?"),
                                             QStringLiteral("This will permanently replace your current %1 transactions and %2 categories with the backup.\n\n"
-                                                           "Consider making a backup of the current data first.")
+                                                           "Consider making a backup of the current data first.%3")
                                                 .arg(s.transactions().size())
-                                                .arg(s.categories().size()),
+                                                .arg(s.categories().size())
+                                                .arg(sync::isConnected(s) ? QStringLiteral("\n\nThis computer uses a shared folder: the restored data will also replace the data on the other computers.") : QString()),
                                             QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
         if (r != QMessageBox::Yes) return;
         QApplication::setOverrideCursor(Qt::WaitCursor);
@@ -294,4 +364,71 @@ void BackupPage::restore()
     m_pending = BackupData();
     m_restoreOptions->hide();
     m_restoreInfo->hide();
+}
+
+void BackupPage::setupSharedFolder()
+{
+    Store &s = Store::instance();
+    const QString start = QDir::homePath();
+    const QString folder = QFileDialog::getExistingDirectory(this, QStringLiteral("Choose the shared folder (e.g. inside Google Drive)"), start);
+    if (folder.isEmpty()) return;
+    const sync::FolderInfo info = sync::inspect(folder);
+    if (!info.exists) {
+        QMessageBox::warning(this, QStringLiteral("Shared folder"), info.error);
+        return;
+    }
+    sync::JoinMode mode = sync::JoinMode::Create;
+    if (!info.hasLedger) {
+        const auto r = QMessageBox::question(
+            this, QStringLiteral("Create shared folder"),
+            QStringLiteral("Share this computer's data through\n%1 ?\n\nThen, on each other computer, install Ledgerly and choose this same folder.")
+                .arg(QDir::toNativeSeparators(folder)));
+        if (r != QMessageBox::Yes) return;
+    } else {
+        QDialog dlg(this);
+        dlg.setWindowTitle(QStringLiteral("Join shared folder"));
+        dlg.setMinimumWidth(520);
+        auto *l = new QVBoxLayout(&dlg);
+        auto *msg = new QLabel(QStringLiteral("This folder already holds Ledgerly data shared by <b>%1</b>%2.<br><br>What should happen to the data on this computer?")
+                                   .arg(info.createdBy.toHtmlEscaped(),
+                                        info.computers.size() > 1 ? QStringLiteral(" (%1 computers)").arg(info.computers.size()) : QString()));
+        msg->setWordWrap(true);
+        l->addWidget(msg);
+        auto *replace = new QRadioButton(QStringLiteral("Use the shared data — replace what's on this computer (best for a new computer)"));
+        auto *merge = new QRadioButton(QStringLiteral("Combine — add this computer's transactions to the shared data"));
+        const bool hasOwnData = !s.transactions().isEmpty();
+        (hasOwnData ? merge : replace)->setChecked(true);
+        l->addWidget(replace);
+        l->addWidget(merge);
+        l->addWidget(ui::muted(hasOwnData ? QStringLiteral("This computer has %1 transactions. If they were already shared from here before, choose “Use the shared data”.").arg(s.transactions().size())
+                                          : QStringLiteral("This computer has no transactions yet.")));
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        bb->button(QDialogButtonBox::Ok)->setText(QStringLiteral("Connect"));
+        bb->button(QDialogButtonBox::Ok)->setObjectName(QStringLiteral("primary"));
+        connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        l->addWidget(bb);
+        if (dlg.exec() != QDialog::Accepted) return;
+        mode = replace->isChecked() ? sync::JoinMode::Replace : sync::JoinMode::Merge;
+        if (mode == sync::JoinMode::Replace && hasOwnData &&
+            QMessageBox::warning(this, QStringLiteral("Replace this computer's data?"),
+                                 QStringLiteral("The %1 transactions on this computer will be replaced by the shared data.\n\nConsider making a backup first.")
+                                     .arg(s.transactions().size()),
+                                 QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes)
+            return;
+    }
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QString err;
+    const bool ok = sync::connect(s, folder, mode, &err);
+    QApplication::restoreOverrideCursor();
+    if (!ok) {
+        QMessageBox::warning(this, QStringLiteral("Shared folder"), QStringLiteral("Couldn't connect: %1").arg(err));
+        sync::disconnect(s);
+    } else {
+        QMessageBox::information(this, QStringLiteral("Shared folder"),
+                                 mode == sync::JoinMode::Create
+                                     ? QStringLiteral("Connected. Now open Ledgerly on your other computers and choose this same folder in Backup & Sync.")
+                                     : QStringLiteral("Connected. This computer now has the shared data."));
+    }
+    refresh();
 }

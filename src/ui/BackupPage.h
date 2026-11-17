@@ -28,8 +28,14 @@ public slots:
 private:
     void restore();
     void saveAutoSettings();
+    void setupSharedFolder();
 
     Banner *m_banner;
+    QLabel *m_syncStatus;
+    QPushButton *m_syncSetup;
+    QPushButton *m_syncNow;
+    QPushButton *m_syncOpen;
+    QPushButton *m_syncDisconnect;
     QLabel *m_stats;
     QLabel *m_last;
     QCheckBox *m_autoOn;

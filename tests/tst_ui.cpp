@@ -1,6 +1,8 @@
 #include "core/Backup.h"
 #include "core/Store.h"
 #include "ui/BackupPage.h"
+#include "ui/ImportDialog.h"
+#include "core/Sync.h"
 #include "ui/CategoryDialog.h"
 #include "ui/MainWindow.h"
 #include "ui/RecurringDialog.h"
@@ -305,6 +307,59 @@ private slots:
         RecurringPage page;
         page.refresh();
         QCOMPARE(page.findChild<QTableWidget *>()->rowCount(), s.recurring().size());
+    }
+
+
+    void importStatementDialog()
+    {
+        Store &s = Store::instance();
+        QString err, accId;
+        Account acc;
+        acc.name = QStringLiteral("Business Checking");
+        QVERIFY(s.saveAccount(acc, &err, &accId));
+        const QString file = m_dir.filePath(QStringLiteral("stmt.csv"));
+        {
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("Date,Description,Amount\n2026-10-02,POS 1234 SHELL OIL 99881,-55.20\n2026-10-03,CLIENT ABC LTD,1500.00\n"
+                    "2026-10-04,GOOGLE *WORKSPACE,-12.00\n");
+        }
+        ImportDialog dlg;
+        dlg.setAccount(accId);
+        QVERIFY(dlg.loadFile(file));
+        QCOMPARE(dlg.items().size(), 3);
+        QCOMPARE(dlg.findChild<QTableWidget *>()->rowCount(), 3);
+        QCOMPARE(dlg.items()[0].tx.description, QStringLiteral("Shell Oil"));
+        QCOMPARE(dlg.items()[1].tx.type, TxType::Income);
+        dlg.doImport();
+        QCOMPARE(dlg.importedCount(), 3);
+        QCOMPARE(s.accountTransactionCount(accId), 3);
+        QVERIFY(!s.account(accId)->csvMapping.isEmpty()); // columns remembered
+
+        // Same file again: everything is recognised as already imported
+        ImportDialog again;
+        again.setAccount(accId);
+        QVERIFY(again.loadFile(file));
+        for (const auto &p : again.items()) QVERIFY(!p.include);
+    }
+
+    void sharedFolderStatus()
+    {
+        QTemporaryDir shared;
+        QString err;
+        QVERIFY2(sync::connect(Store::instance(), shared.path(), sync::JoinMode::Create, &err), qPrintable(err));
+        BackupPage page;
+        page.refresh();
+        bool connected = false;
+        for (auto *l : page.findChildren<QLabel *>())
+            if (l->text().contains(QStringLiteral("Connected"))) connected = true;
+        QVERIFY(connected);
+        sync::disconnect(Store::instance());
+        page.refresh();
+        bool notConnected = false;
+        for (auto *l : page.findChildren<QLabel *>())
+            if (l->text().contains(QStringLiteral("Not connected"))) notConnected = true;
+        QVERIFY(notConnected);
     }
 
     void mainWindowPages()
