@@ -1,7 +1,6 @@
 #include "core/Backup.h"
 #include "core/BankImport.h"
 #include "core/Defaults.h"
-#include "core/Institutions.h"
 #include "core/Recurrence.h"
 #include "core/Reports.h"
 #include "core/SimpleFin.h"
@@ -662,7 +661,7 @@ private slots:
     }
 
 
-    void wellsFargoAndAmexStatements()
+    void bankAndCardCsvVariants()
     {
         Store &s = store();
         QString err, wfId, amexId;
@@ -679,10 +678,9 @@ private slots:
         QCOMPARE(r.lines[0].amount, -6140);
         QCOMPARE(bank::cleanDescription(r.lines[0].description), QStringLiteral("Shell Oil Houston Tx"));
 
-        const auto *preset = institutions::find(QStringLiteral("wells-bank"));
-        QVERIFY(preset && preset->kind == QLatin1String("bank"));
         Account wfAcc;
-        wfAcc.name = preset->accountName;
+        wfAcc.name = QStringLiteral("Business Checking");
+        wfAcc.kind = QStringLiteral("bank");
         QVERIFY(s.saveAccount(wfAcc, &err, &wfId));
         auto items = bank::prepare(s, *s.account(wfId), r.lines, bank::flipApplies(*s.account(wfId), r.format));
         QCOMPARE(items[1].tx.type, TxType::Income);
@@ -704,13 +702,11 @@ private slots:
         QCOMPARE(r.lines[0].externalId, QStringLiteral("csv:320263060012345678"));
         QCOMPARE(r.lines[0].date, QDate(2026, 11, 2));
 
-        const auto *amexPreset = institutions::find(QStringLiteral("amex-card"));
-        QVERIFY(amexPreset && amexPreset->csvChargesPositive && amexPreset->kind == QLatin1String("card"));
         Account amexAcc;
-        amexAcc.name = amexPreset->accountName;
-        amexAcc.kind = amexPreset->kind;
+        amexAcc.name = QStringLiteral("Business Credit Card");
+        amexAcc.kind = QStringLiteral("card");
         QVERIFY(s.saveAccount(amexAcc, &err, &amexId));
-        // Even without the preset's setting, a card statement that is mostly "income" is recognised
+        // Without the account's flip setting, a card statement that is mostly "income" is recognised
         QVERIFY(bank::chargesLookPositive(*s.account(amexId), r.lines));
         QVERIFY(!bank::flipApplies(*s.account(amexId), r.format));
         items = bank::prepare(s, *s.account(amexId), r.lines, true);

@@ -289,7 +289,7 @@ void ImportDialog::reparse(bool fromUi)
     if (!m_parse.accountHint.isEmpty()) info += QStringLiteral(" · account %1").arg(m_parse.accountHint.right(8).toHtmlEscaped());
     if (m_parse.looksLikeCard && !acc.isCard() && !acc.id.isEmpty()) info += QStringLiteral(" · <i>this looks like a credit-card statement</i>");
     if (acc.id.isEmpty()) info += ui::colorSpan(QStringLiteral(" — choose or create the account it belongs to"), Theme::c().badText, true);
-    // Card statements that list charges as positive numbers (e.g. American Express CSV)
+    // Card statements that list charges as positive numbers (common in credit-card CSV files)
     if (m_parse.format != QLatin1String("OFX") && !m_flip->isChecked() && bank::chargesLookPositive(acc, m_parse.lines)) {
         m_updating = true;
         m_flip->setChecked(true);

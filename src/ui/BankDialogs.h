@@ -26,8 +26,6 @@ private:
     SegmentedControl *m_kind;
     QCheckBox *m_flip;
     QLineEdit *m_folder;
-    QComboBox *m_preset;
-    class QLabel *m_help;
 };
 
 /* "When the description contains … → category / ignore". */

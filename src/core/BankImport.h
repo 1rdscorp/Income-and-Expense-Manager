@@ -73,7 +73,7 @@ struct Suggestion {
     bool ignore = false;
     bool transfer = false; // looks like a card payment / transfer between own accounts
 };
-// True for lines like "AUTOPAY PAYMENT - THANK YOU" or "AMERICAN EXPRESS ACH PMT".
+// True for lines like "AUTOPAY PAYMENT - THANK YOU" or "CREDIT CARD ACH PMT".
 bool looksLikeTransfer(const QString &description);
 Suggestion suggestCategory(const Store &store, const QString &description, TxType type);
 
@@ -87,7 +87,7 @@ struct Proposed {
 };
 
 // Turns statement lines into transactions for an account. flipSigns: the file shows money
-// going out as positive numbers (e.g. American Express CSV) - swap income and expenses.
+// going out as positive numbers (common in credit-card CSV files) - swap income and expenses.
 QVector<Proposed> prepare(const Store &store, const Account &account, const QVector<StatementLine> &lines, bool flipSigns = false);
 // Whether the account's "swap signs" setting applies to this file format (CSV/QIF only;
 // OFX/QFX/QBO and live connections always use the standard sign convention).

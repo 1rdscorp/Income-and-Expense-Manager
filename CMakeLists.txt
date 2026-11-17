@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(Ledgerly
-    VERSION 1.4.0
+    VERSION 1.4.1
     DESCRIPTION "Income & Expense Manager for small businesses"
     HOMEPAGE_URL "https://github.com/1rdscorp/Income-and-Expense-Manager"
     LANGUAGES CXX)
@@ -36,7 +36,6 @@ add_library(ledgerly_core STATIC
     src/core/Sync.h src/core/Sync.cpp
     src/core/BankImport.h src/core/BankImport.cpp
     src/core/SimpleFin.h src/core/SimpleFin.cpp
-    src/core/Institutions.h src/core/Institutions.cpp
 )
 target_include_directories(ledgerly_core PUBLIC src)
 target_link_libraries(ledgerly_core PUBLIC Qt6::Core Qt6::Sql Qt6::Network)
