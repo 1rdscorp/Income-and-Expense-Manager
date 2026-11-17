@@ -87,7 +87,7 @@ jobs:
           if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "Ledgerly did not exit in time" }
           if ($p.ExitCode -ne 0) { throw "Ledgerly exited with code $($p.ExitCode)" }
           $n = (Get-ChildItem $shots -Filter *.png).Count
-          if ($n -ne 6) { throw "Expected 6 screenshots, got $n" }
+          if ($n -ne 7) { throw "Expected 7 screenshots, got $n" }
           if (-not (Test-Path (Join-Path $data "ledgerly.db"))) { throw "Database was not created" }
           Write-Host "Smoke test OK: $n pages rendered"
 

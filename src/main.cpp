@@ -38,6 +38,8 @@ int main(int argc, char *argv[])
         return 1;
     }
     Theme::instance().apply(Store::instance().settings().theme);
+    // Record recurring payments that fell due while the app was closed.
+    Store::instance().processRecurring();
 
     MainWindow w;
     w.show();
@@ -46,7 +48,7 @@ int main(int argc, char *argv[])
         const QString dir = parser.value(shotOpt);
         QDir().mkpath(dir);
         QTimer::singleShot(400, &w, [&w, dir]() {
-            const char *names[] = {"dashboard", "transactions", "categories", "reports", "backup", "settings"};
+            const char *names[] = {"dashboard", "transactions", "categories", "recurring", "reports", "backup", "settings"};
             for (int i = 0; i < MainWindow::PageCount; ++i) {
                 w.showPage(i);
                 QApplication::processEvents();

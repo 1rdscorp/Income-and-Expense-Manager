@@ -98,6 +98,8 @@ QLabel#kpiValueSmall { font-size: 18px; font-weight: 700; }
 QLabel#kpiMeta { color: @muted; font-size: 12px; }
 QFrame#banner { background: @warningBg; border: 1px solid @warningBorder; border-radius: 12px; }
 QFrame#banner QLabel { background: transparent; }
+QFrame#infoBanner { background: @accentSoft; border: 1px solid @accent; border-radius: 12px; }
+QFrame#infoBanner QLabel { background: transparent; }
 QPushButton { background: @surface; border: 1px solid @borderStrong; border-radius: 8px; padding: 6px 14px; min-height: 22px; }
 QPushButton:hover { background: @surface3; }
 QPushButton:pressed { background: @borderStrong; }

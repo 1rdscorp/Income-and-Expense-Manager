@@ -4,10 +4,12 @@
 #include "Theme.h"
 #include "Widgets.h"
 #include "core/Defaults.h"
+#include "core/Recurrence.h"
 #include "core/Store.h"
 #include "core/Util.h"
 
 #include <QBuffer>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCompleter>
 #include <QDateEdit>
@@ -150,6 +152,45 @@ TransactionDialog::TransactionDialog(QWidget *parent)
     g->setColumnStretch(1, 1);
     root->addLayout(g);
 
+    // Repeat (new transactions) / series notice (recorded by a recurring rule)
+    m_repeatRow = new QWidget;
+    auto *rr = new QHBoxLayout(m_repeatRow);
+    rr->setContentsMargins(0, 0, 0, 0);
+    m_repeat = new QCheckBox(QStringLiteral("Repeat this transaction"));
+    m_repeat->setObjectName(QStringLiteral("repeatCheck"));
+    m_repeat->setIcon(Theme::icon(QStringLiteral("repeat"), Theme::c().accent));
+    m_repeatFreq = new QComboBox;
+    m_repeatFreq->setObjectName(QStringLiteral("repeatFreq"));
+    for (Frequency f : {Frequency::Monthly, Frequency::Weekly, Frequency::Quarterly, Frequency::Yearly})
+        m_repeatFreq->addItem(frequencyLabel(f), frequencyToString(f));
+    m_repeatFreq->setEnabled(false);
+    m_repeatHint = ui::muted(QString());
+    rr->addWidget(m_repeat);
+    rr->addWidget(m_repeatFreq);
+    rr->addWidget(m_repeatHint, 1);
+    root->addWidget(m_repeatRow);
+    m_seriesNote = ui::muted(QString());
+    m_seriesNote->setTextFormat(Qt::RichText);
+    m_seriesNote->hide();
+    root->addWidget(m_seriesNote);
+    auto syncRepeat = [this]() {
+        m_repeatFreq->setEnabled(m_repeat->isChecked());
+        if (!m_repeat->isChecked()) {
+            m_repeatHint->setText(QStringLiteral("e.g. rent, internet, subscriptions"));
+            return;
+        }
+        Recurring r;
+        r.frequency = frequencyFromString(m_repeatFreq->currentData().toString());
+        r.startDate = m_date->date();
+        r.day = r.startDate.day();
+        const QDate next = recurrence::advance(r.startDate, r.frequency, r.day);
+        m_repeatHint->setText(QStringLiteral("%1 — next on %2, recorded automatically").arg(recurrence::describe(r), util::fmtDate(next)));
+    };
+    connect(m_repeat, &QCheckBox::toggled, this, syncRepeat);
+    connect(m_repeatFreq, &QComboBox::currentIndexChanged, this, syncRepeat);
+    connect(m_date, &QDateEdit::dateChanged, this, syncRepeat);
+    syncRepeat();
+
     // Receipts
     auto *rc = new QFrame;
     rc->setObjectName(QStringLiteral("card"));
@@ -247,6 +288,9 @@ void TransactionDialog::setNewType(TxType type)
     m_type = type;
     m_deleteBtn->hide();
     m_anotherBtn->show();
+    m_repeatRow->show();
+    m_repeat->setChecked(false);
+    m_seriesNote->hide();
     m_receipts.clear();
     m_removed.clear();
     loadFields(m_tx);
@@ -263,6 +307,15 @@ void TransactionDialog::setTransaction(const Transaction &t)
     m_typeSeg->setValue(typeToString(t.type));
     m_deleteBtn->show();
     m_anotherBtn->hide();
+    m_repeatRow->hide();
+    if (const Recurring *rule = Store::instance().recurringRule(t.recurringId)) {
+        m_seriesNote->setText(QStringLiteral("🔁 Recorded automatically by the recurring “%1” (%2). Changes here apply to this payment only — "
+                                             "edit the series on the <b>Recurring</b> page.")
+                                  .arg(rule->title().toHtmlEscaped(), recurrence::describe(*rule).toLower().toHtmlEscaped()));
+        m_seriesNote->show();
+    } else {
+        m_seriesNote->hide();
+    }
     m_saveBtn->setText(QStringLiteral("Save changes"));
     m_receipts.clear();
     m_removed.clear();
@@ -439,9 +492,31 @@ void TransactionDialog::save(bool another)
     for (const auto &p : m_receipts)
         if (p.isNew) fresh << p.r;
     QString err;
+    Recurring rule;
+    const bool repeat = !m_editing && m_repeat->isChecked();
+    if (repeat) {
+        // This transaction is the first payment of the new series.
+        rule.id = util::newId();
+        t.recurringId = rule.id;
+    }
     if (!Store::instance().saveTransaction(t, fresh, m_removed, &err)) {
         QMessageBox::warning(this, windowTitle(), err);
         return;
+    }
+    if (repeat) {
+        rule.type = t.type;
+        rule.categoryId = t.categoryId;
+        rule.amount = t.amount;
+        rule.description = t.description.isEmpty() ? (t.vendor.isEmpty() ? m_category->currentText().section(QStringLiteral("   "), -1) : QString()) : t.description;
+        rule.vendor = t.vendor;
+        rule.paymentMethod = t.paymentMethod;
+        rule.notes = t.notes;
+        rule.frequency = frequencyFromString(m_repeatFreq->currentData().toString());
+        rule.startDate = t.date;
+        rule.day = t.date.day();
+        rule.nextDate = recurrence::advance(t.date, rule.frequency, rule.day);
+        if (!Store::instance().saveRecurring(rule, &err))
+            QMessageBox::warning(this, windowTitle(), QStringLiteral("The transaction was saved, but the repeat could not be set up: %1").arg(err));
     }
     g_lastType = t.type;
     g_lastCategory.insert(static_cast<int>(t.type), t.categoryId);

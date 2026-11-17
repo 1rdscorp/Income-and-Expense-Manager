@@ -4,11 +4,13 @@
 #include "MainWindow.h"
 #include "Theme.h"
 #include "Widgets.h"
+#include "core/Recurrence.h"
 #include "core/Store.h"
 #include "core/Util.h"
 
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QLocale>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
@@ -45,6 +47,30 @@ DashboardPage::DashboardPage(QWidget *parent)
     m_banner->button()->setProperty("iconName", QStringLiteral("download"));
     connect(m_banner->button(), &QPushButton::clicked, this, &DashboardPage::requestBackup);
     root->addWidget(m_banner);
+
+    // Notice for payments recorded automatically by recurring rules
+    m_autoBanner = new QFrame;
+    m_autoBanner->setObjectName(QStringLiteral("infoBanner"));
+    auto *ab = new QHBoxLayout(m_autoBanner);
+    ab->setContentsMargins(14, 10, 14, 10);
+    ab->setSpacing(12);
+    auto *abIcon = new QLabel;
+    abIcon->setObjectName(QStringLiteral("autoIcon"));
+    m_autoText = new QLabel;
+    m_autoText->setWordWrap(true);
+    m_autoText->setTextFormat(Qt::RichText);
+    auto *abView = ui::button(QStringLiteral("View"));
+    auto *abDismiss = ui::button(QStringLiteral("Dismiss"));
+    ab->addWidget(abIcon, 0, Qt::AlignTop);
+    ab->addWidget(m_autoText, 1);
+    ab->addWidget(abView);
+    ab->addWidget(abDismiss);
+    connect(abView, &QPushButton::clicked, this, [this]() { emit requestPage(MainWindow::Transactions); });
+    connect(abDismiss, &QPushButton::clicked, this, [this]() {
+        Store::instance().clearAutoPosted();
+        refresh();
+    });
+    root->addWidget(m_autoBanner);
 
     // Empty state
     auto *empty = new Card;
@@ -149,12 +175,39 @@ DashboardPage::DashboardPage(QWidget *parent)
     recentCard->body()->addStretch(1);
     row3->addWidget(recentCard, 1);
 
+    auto *rightCol = new QVBoxLayout;
+    rightCol->setSpacing(16);
+    auto *upCard = new Card(QStringLiteral("Upcoming"), QStringLiteral("Next 30 days"));
+    auto *manage = new QPushButton(QStringLiteral("Manage recurring"));
+    manage->setObjectName(QStringLiteral("link"));
+    manage->setCursor(Qt::PointingHandCursor);
+    connect(manage, &QPushButton::clicked, this, [this]() { emit requestPage(MainWindow::Recurring); });
+    upCard->header()->addWidget(manage);
+    m_upcoming = new QTreeWidget;
+    m_upcoming->setColumnCount(3);
+    m_upcoming->setHeaderHidden(true);
+    m_upcoming->setRootIsDecorated(false);
+    m_upcoming->setUniformRowHeights(true);
+    m_upcoming->setSelectionMode(QAbstractItemView::NoSelection);
+    m_upcoming->setFocusPolicy(Qt::NoFocus);
+    m_upcoming->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_upcoming->header()->setStretchLastSection(false);
+    m_upcoming->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_upcoming->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_upcoming->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    upCard->body()->addWidget(m_upcoming);
+    m_upcomingEmpty = ui::muted(QStringLiteral("No bills due. Add rent, internet and other regular payments on the Recurring page "
+                                               "and they'll be recorded automatically."));
+    upCard->body()->addWidget(m_upcomingEmpty);
+    rightCol->addWidget(upCard);
+
     auto *weekCard = new Card(QStringLiteral("Last 7 days"), QStringLiteral("Daily totals"));
     m_week = new HBarList;
     weekCard->body()->addWidget(m_week);
     weekCard->body()->addWidget(ui::muted(QStringLiteral("Bars show expenses; income shown in green.")));
     weekCard->body()->addStretch(1);
-    row3->addWidget(weekCard, 1);
+    rightCol->addWidget(weekCard, 1);
+    row3->addLayout(rightCol, 1);
     cl->addLayout(row3);
     cl->addStretch(1);
 
@@ -181,6 +234,26 @@ void DashboardPage::refresh()
     m_banner->setText(QStringLiteral("<b>Time for a backup.</b> %1 Your data lives only on this computer — keep a copy somewhere safe.")
                           .arg(last.isEmpty() ? QStringLiteral("You haven't backed up your data yet.")
                                               : QStringLiteral("Your last backup was on %1.").arg(util::fmtDateTime(last))));
+
+    const auto &autoPosted = s.autoPosted();
+    m_autoBanner->setVisible(!autoPosted.isEmpty());
+    if (!autoPosted.isEmpty()) {
+        if (auto *ic = m_autoBanner->findChild<QLabel *>(QStringLiteral("autoIcon"))) ic->setPixmap(Theme::iconPixmap(QStringLiteral("repeat"), t.accent, 20));
+        QStringList items;
+        qint64 total = 0;
+        for (int i = 0; i < autoPosted.size(); ++i) {
+            const Transaction &x = autoPosted[i];
+            total += x.type == TxType::Income ? x.amount : -x.amount;
+            if (i < 3) {
+                const QString name = x.description.isEmpty() ? s.categoryOrUnknown(x.categoryId).name : x.description;
+                items << QStringLiteral("%1 %2 (%3)").arg(name.toHtmlEscaped(), util::money(x.amount), QLocale().toString(x.date, QStringLiteral("d MMM")));
+            }
+        }
+        if (autoPosted.size() > 3) items << QStringLiteral("%1 more").arg(autoPosted.size() - 3);
+        m_autoText->setText(QStringLiteral("<b>%1 recurring payment%2 recorded automatically:</b> %3")
+                                .arg(autoPosted.size())
+                                .arg(autoPosted.size() == 1 ? QString() : QStringLiteral("s"), items.join(QStringLiteral(", "))));
+    }
 
     const bool empty = s.transactions().isEmpty();
     m_empty->setVisible(empty);
@@ -309,4 +382,35 @@ void DashboardPage::refresh()
         days << r;
     }
     m_week->setRows(days);
+
+    // Upcoming recurring payments
+    m_upcoming->clear();
+    const auto up = s.upcoming(today, today.addDays(30));
+    for (int i = 0; i < std::min<int>(6, up.size()); ++i) {
+        const QDate &d = up[i].first;
+        const Recurring &r = up[i].second;
+        const Category c = s.categoryOrUnknown(r.categoryId);
+        const qint64 in = today.daysTo(d);
+        auto *it = new QTreeWidgetItem(m_upcoming);
+        it->setText(0, in == 0 ? QStringLiteral("Today") : in == 1 ? QStringLiteral("Tomorrow") : QLocale().toString(d, QStringLiteral("ddd d MMM")));
+        it->setToolTip(0, in > 1 ? QStringLiteral("in %1 days").arg(in) : QString());
+        it->setForeground(0, in <= 3 ? t.text : t.muted);
+        it->setText(1, c.icon + QStringLiteral("  ") + (r.title().isEmpty() ? c.name : r.title()));
+        it->setToolTip(1, recurrence::describe(r));
+        it->setText(2, (r.type == TxType::Income ? QStringLiteral("+") : QStringLiteral("−")) + util::money(r.amount));
+        it->setTextAlignment(2, Qt::AlignRight | Qt::AlignVCenter);
+        it->setForeground(2, r.type == TxType::Income ? t.goodText : t.text);
+        QFont f = it->font(2);
+        f.setWeight(QFont::DemiBold);
+        it->setFont(2, f);
+    }
+    if (up.size() > 6) {
+        auto *more = new QTreeWidgetItem(m_upcoming);
+        more->setText(1, QStringLiteral("+ %1 more").arg(up.size() - 6));
+        more->setForeground(1, t.muted);
+    }
+    m_upcoming->setVisible(!up.isEmpty());
+    m_upcomingEmpty->setVisible(up.isEmpty());
+    const int upRowH = m_upcoming->sizeHintForRow(0) > 0 ? m_upcoming->sizeHintForRow(0) : 26;
+    m_upcoming->setFixedHeight(upRowH * m_upcoming->topLevelItemCount() + 6);
 }

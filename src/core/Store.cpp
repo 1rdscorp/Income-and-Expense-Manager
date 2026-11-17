@@ -1,5 +1,6 @@
 #include "Store.h"
 #include "Defaults.h"
+#include "Recurrence.h"
 #include "Util.h"
 
 #include <QDateTime>
@@ -129,10 +130,22 @@ bool Store::createSchema(QString *error)
         "CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, transaction_id TEXT NOT NULL, name TEXT,"
         " mime TEXT, size INTEGER, data BLOB, created_at TEXT)",
         "CREATE INDEX IF NOT EXISTS idx_receipt_tx ON receipts(transaction_id)",
+        "CREATE TABLE IF NOT EXISTS recurring (id TEXT PRIMARY KEY, type TEXT NOT NULL, category_id TEXT,"
+        " amount INTEGER NOT NULL, description TEXT, vendor TEXT, payment_method TEXT, notes TEXT,"
+        " frequency TEXT NOT NULL, day INTEGER NOT NULL, start_date TEXT NOT NULL, end_date TEXT,"
+        " next_date TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT, updated_at TEXT)",
     };
     for (const char *s : stmts)
         if (!exec(QString::fromLatin1(s), error)) return false;
-    return true;
+
+    // v1.0 databases: add the link from transactions to their recurring rule
+    QSqlQuery info(m_db);
+    bool hasRecurringId = false;
+    if (info.exec(QStringLiteral("PRAGMA table_info(transactions)")))
+        while (info.next())
+            if (info.value(1).toString() == QLatin1String("recurring_id")) hasRecurringId = true;
+    if (!hasRecurringId && !exec(QStringLiteral("ALTER TABLE transactions ADD COLUMN recurring_id TEXT"), error)) return false;
+    return exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_tx_recurring ON transactions(recurring_id)"), error);
 }
 
 void Store::loadCache()
@@ -140,6 +153,7 @@ void Store::loadCache()
     m_categories.clear();
     m_transactions.clear();
     m_receiptCounts.clear();
+    m_recurring.clear();
     m_receiptBytes = 0;
 
     QSqlQuery q(m_db);
@@ -157,7 +171,7 @@ void Store::loadCache()
     sortCategories();
 
     q.exec(QStringLiteral("SELECT id, type, category_id, amount, date, description, vendor, payment_method, notes,"
-                          " created_at, updated_at FROM transactions"));
+                          " created_at, updated_at, recurring_id FROM transactions"));
     while (q.next()) {
         Transaction t;
         t.id = q.value(0).toString();
@@ -171,9 +185,34 @@ void Store::loadCache()
         t.notes = q.value(8).toString();
         t.createdAt = q.value(9).toString();
         t.updatedAt = q.value(10).toString();
+        t.recurringId = q.value(11).toString();
         m_transactions.push_back(t);
     }
     sortTransactions();
+
+    q.exec(QStringLiteral("SELECT id, type, category_id, amount, description, vendor, payment_method, notes, frequency, day,"
+                          " start_date, end_date, next_date, active, created_at, updated_at FROM recurring"));
+    while (q.next()) {
+        Recurring r;
+        r.id = q.value(0).toString();
+        r.type = typeFromString(q.value(1).toString());
+        r.categoryId = q.value(2).toString();
+        r.amount = q.value(3).toLongLong();
+        r.description = q.value(4).toString();
+        r.vendor = q.value(5).toString();
+        r.paymentMethod = q.value(6).toString();
+        r.notes = q.value(7).toString();
+        r.frequency = frequencyFromString(q.value(8).toString());
+        r.day = q.value(9).toInt();
+        r.startDate = QDate::fromString(q.value(10).toString(), Qt::ISODate);
+        r.endDate = QDate::fromString(q.value(11).toString(), Qt::ISODate);
+        r.nextDate = QDate::fromString(q.value(12).toString(), Qt::ISODate);
+        r.active = q.value(13).toInt() != 0;
+        r.createdAt = q.value(14).toString();
+        r.updatedAt = q.value(15).toString();
+        m_recurring.push_back(r);
+    }
+    sortRecurring();
 
     q.exec(QStringLiteral("SELECT transaction_id, COUNT(*), SUM(size) FROM receipts GROUP BY transaction_id"));
     while (q.next()) {
@@ -290,12 +329,21 @@ bool Store::saveCategory(const Category &input, QString *error)
         q.addBindValue(util::nowIso());
         q.addBindValue(c.id);
         ok = q.exec();
+        if (ok) {
+            q.prepare(QStringLiteral("UPDATE recurring SET type = ? WHERE category_id = ?"));
+            q.addBindValue(typeToString(c.type));
+            q.addBindValue(c.id);
+            ok = q.exec();
+        }
     }
     if (!ok || !m_db.commit()) {
         if (error) *error = m_db.lastError().text();
         m_db.rollback();
         return false;
     }
+    if (typeChanged)
+        for (auto &r : m_recurring)
+            if (r.categoryId == c.id) r.type = c.type;
     if (old) m_categories[m_catIndex.value(c.id)] = c;
     else m_categories.push_back(c);
     if (typeChanged)
@@ -339,6 +387,18 @@ bool Store::deleteCategory(const QString &id, const QString &moveTo, QString *er
                 ok = q.exec();
             }
         }
+    }
+    if (ok) {
+        if (!moveTo.isEmpty()) {
+            q.prepare(QStringLiteral("UPDATE recurring SET category_id = ?, type = ? WHERE category_id = ?"));
+            q.addBindValue(moveTo);
+            q.addBindValue(typeToString(category(moveTo)->type));
+            q.addBindValue(id);
+        } else {
+            q.prepare(QStringLiteral("DELETE FROM recurring WHERE category_id = ?"));
+            q.addBindValue(id);
+        }
+        ok = q.exec();
     }
     if (ok) {
         q.prepare(QStringLiteral("DELETE FROM categories WHERE id = ?"));
@@ -397,7 +457,7 @@ bool Store::writeTransaction(const Transaction &t)
 {
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("INSERT OR REPLACE INTO transactions(id, type, category_id, amount, date, description, vendor,"
-                             " payment_method, notes, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)"));
+                             " payment_method, notes, created_at, updated_at, recurring_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"));
     q.addBindValue(t.id);
     q.addBindValue(typeToString(t.type));
     q.addBindValue(t.categoryId);
@@ -409,6 +469,32 @@ bool Store::writeTransaction(const Transaction &t)
     q.addBindValue(t.notes);
     q.addBindValue(t.createdAt);
     q.addBindValue(t.updatedAt);
+    q.addBindValue(t.recurringId.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(t.recurringId));
+    return q.exec();
+}
+
+bool Store::writeRecurring(const Recurring &r)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR REPLACE INTO recurring(id, type, category_id, amount, description, vendor, payment_method, notes,"
+                             " frequency, day, start_date, end_date, next_date, active, created_at, updated_at)"
+                             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+    q.addBindValue(r.id);
+    q.addBindValue(typeToString(r.type));
+    q.addBindValue(r.categoryId);
+    q.addBindValue(r.amount);
+    q.addBindValue(r.description);
+    q.addBindValue(r.vendor);
+    q.addBindValue(r.paymentMethod);
+    q.addBindValue(r.notes);
+    q.addBindValue(frequencyToString(r.frequency));
+    q.addBindValue(r.day);
+    q.addBindValue(r.startDate.toString(Qt::ISODate));
+    q.addBindValue(r.endDate.isValid() ? r.endDate.toString(Qt::ISODate) : QString());
+    q.addBindValue(r.nextDate.isValid() ? r.nextDate.toString(Qt::ISODate) : QString());
+    q.addBindValue(r.active ? 1 : 0);
+    q.addBindValue(r.createdAt);
+    q.addBindValue(r.updatedAt);
     return q.exec();
 }
 
@@ -570,7 +656,7 @@ QVector<Receipt> Store::allReceipts() const
 bool Store::clearTables()
 {
     return exec(QStringLiteral("DELETE FROM receipts")) && exec(QStringLiteral("DELETE FROM transactions")) &&
-           exec(QStringLiteral("DELETE FROM categories"));
+           exec(QStringLiteral("DELETE FROM categories")) && exec(QStringLiteral("DELETE FROM recurring"));
 }
 
 bool Store::replaceAll(const BackupData &data, QString *error)
@@ -580,11 +666,13 @@ bool Store::replaceAll(const BackupData &data, QString *error)
     for (const auto &c : data.categories) ok = ok && writeCategory(c);
     for (const auto &t : data.transactions) ok = ok && writeTransaction(t);
     for (const auto &r : data.receipts) ok = ok && writeReceipt(r);
+    for (const auto &r : data.recurring) ok = ok && writeRecurring(r);
     if (!ok || !m_db.commit()) {
         if (error) *error = m_db.lastError().text();
         m_db.rollback();
         return false;
     }
+    m_autoPosted.clear();
     Settings s = data.settings;
     s.lastBackupAt = util::nowIso();
     // keep this computer's auto-backup configuration
@@ -592,6 +680,7 @@ bool Store::replaceAll(const BackupData &data, QString *error)
     s.autoBackupKeep = m_settings.autoBackupKeep;
     saveSettings(s);
     loadCache();
+    processRecurring();
     markDirty();
     emit dataChanged();
     return true;
@@ -631,18 +720,29 @@ bool Store::merge(const BackupData &data, MergeStats *stats, QString *error)
     QVector<Receipt> newReceipts;
     for (const auto &r : data.receipts)
         if (newTxIds.contains(r.transactionId)) newReceipts.push_back(r);
+    QSet<QString> ruleIds;
+    for (const auto &r : m_recurring) ruleIds.insert(r.id);
+    QVector<Recurring> newRules;
+    for (Recurring r : data.recurring) {
+        if (ruleIds.contains(r.id)) continue;
+        r.categoryId = remap.value(r.categoryId, r.categoryId);
+        newRules.push_back(r);
+    }
 
     m_db.transaction();
     bool ok = true;
     for (const auto &c : newCats) ok = ok && writeCategory(c);
     for (const auto &t : newTx) ok = ok && writeTransaction(t);
     for (const auto &r : newReceipts) ok = ok && writeReceipt(r);
+    for (const auto &r : newRules) ok = ok && writeRecurring(r);
     if (!ok || !m_db.commit()) {
         if (error) *error = m_db.lastError().text();
         m_db.rollback();
         return false;
     }
-    if (stats) *stats = {static_cast<int>(newCats.size()), static_cast<int>(newTx.size()), static_cast<int>(newReceipts.size())};
+    loadCache();
+    processRecurring();
+    if (stats) *stats = {static_cast<int>(newCats.size()), static_cast<int>(newTx.size()), static_cast<int>(newReceipts.size()), static_cast<int>(newRules.size())};
     loadCache();
     markDirty();
     emit dataChanged();
@@ -657,6 +757,7 @@ bool Store::eraseAll(QString *error)
         m_db.rollback();
         return false;
     }
+    m_autoPosted.clear();
     Settings fresh;
     fresh.autoBackupDir = m_settings.autoBackupDir;
     fresh.autoBackupKeep = m_settings.autoBackupKeep;
@@ -702,20 +803,15 @@ int Store::loadSampleData()
         out.push_back(t);
     };
 
+    struct Fixed { int d; const char *cat; qint64 amt; const char *desc; const char *vendor; const char *pm; };
     const QDate today = QDate::currentDate();
     for (int k = 5; k >= 0; --k) {
         const QDate first = QDate(today.year(), today.month(), 1).addMonths(-k);
         const int dim = first.daysInMonth();
         auto day = [&](int d) { return QDate(first.year(), first.month(), std::min(d, dim)); };
-        struct Fixed { int d; const char *cat; qint64 amt; const char *desc; const char *vendor; const char *pm; };
+        // Fixed monthly costs (rent, internet, payroll...) come from recurring rules below.
         const Fixed fixed[] = {
-            {1, "Rent & Lease", 180000, "Monthly shop rent", "Oakview Properties", "Bank transfer"},
-            {3, "Software & Subscriptions", 4900, "Accounting software", "CloudBooks", "Credit card"},
-            {5, "Telephone & Internet", 8900, "Business broadband", "NetLink", "Bank transfer"},
-            {8, "Insurance", 21500, "Liability insurance", "SafeGuard Insurance", "Bank transfer"},
             {12, "Utilities", between(140, 260), "Electricity bill", "City Power", "Bank transfer"},
-            {15, "Payroll & Wages", 320000, "Payroll - 1st half", "Staff", "Bank transfer"},
-            {28, "Payroll & Wages", 320000, "Payroll - 2nd half", "Staff", "Bank transfer"},
             {20, "Advertising & Marketing", between(150, 450), "Social media ads", "AdReach", "Credit card"},
         };
         for (const auto &f : fixed)
@@ -753,11 +849,232 @@ int Store::loadSampleData()
             writeCategory(cc);
         }
     }
+    // Recurring rules starting six months ago; processing them records every past payment.
+    const QDate start = QDate(today.year(), today.month(), 1).addMonths(-5);
+    const Fixed rules[] = {
+        {1, "Rent & Lease", 180000, "Monthly shop rent", "Oakview Properties", "Bank transfer"},
+        {3, "Software & Subscriptions", 4900, "Accounting software", "CloudBooks", "Credit card"},
+        {5, "Telephone & Internet", 8900, "Business internet", "NetLink", "Bank transfer"},
+        {8, "Insurance", 21500, "Liability insurance", "SafeGuard Insurance", "Bank transfer"},
+        {15, "Payroll & Wages", 320000, "Payroll - 1st half", "Staff", "Bank transfer"},
+        {28, "Payroll & Wages", 320000, "Payroll - 2nd half", "Staff", "Bank transfer"},
+    };
+    for (const auto &f : rules) {
+        const Category *c = byName(QString::fromUtf8(f.cat));
+        if (!c) continue;
+        Recurring r;
+        r.id = util::newId();
+        r.type = c->type;
+        r.categoryId = c->id;
+        r.amount = f.amt;
+        r.description = QString::fromUtf8(f.desc);
+        r.vendor = QString::fromUtf8(f.vendor);
+        r.paymentMethod = QString::fromUtf8(f.pm);
+        r.frequency = Frequency::Monthly;
+        r.day = f.d;
+        r.startDate = QDate(start.year(), start.month(), f.d);
+        r.nextDate = r.startDate;
+        r.createdAt = now;
+        r.updatedAt = now;
+        writeRecurring(r);
+    }
     m_db.commit();
     loadCache();
+    const int posted = static_cast<int>(processRecurring(today, false).size());
     markDirty();
     emit dataChanged();
-    return static_cast<int>(out.size());
+    return static_cast<int>(out.size()) + posted;
+}
+
+/* ---------------- Recurring ---------------- */
+
+void Store::sortRecurring()
+{
+    std::stable_sort(m_recurring.begin(), m_recurring.end(), [](const Recurring &a, const Recurring &b) {
+        if (a.active != b.active) return a.active;
+        const QDate an = a.finished() ? QDate(9999, 1, 1) : a.nextDate;
+        const QDate bn = b.finished() ? QDate(9999, 1, 1) : b.nextDate;
+        if (an != bn) return an < bn;
+        return QString::localeAwareCompare(a.title(), b.title()) < 0;
+    });
+}
+
+const Recurring *Store::recurringRule(const QString &id) const
+{
+    for (const auto &r : m_recurring)
+        if (r.id == id) return &r;
+    return nullptr;
+}
+
+int Store::recurringPostedCount(const QString &id) const
+{
+    int n = 0;
+    for (const auto &t : m_transactions)
+        if (t.recurringId == id) ++n;
+    return n;
+}
+
+bool Store::saveRecurring(const Recurring &input, QString *error, const QDate &today)
+{
+    Recurring r = input;
+    if (r.amount <= 0) {
+        if (error) *error = QStringLiteral("Enter an amount greater than zero.");
+        return false;
+    }
+    const Category *c = category(r.categoryId);
+    if (!c) {
+        if (error) *error = QStringLiteral("Choose a category.");
+        return false;
+    }
+    if (!r.startDate.isValid()) {
+        if (error) *error = QStringLiteral("Choose the date of the first payment.");
+        return false;
+    }
+    if (r.endDate.isValid() && r.endDate < r.startDate) {
+        if (error) *error = QStringLiteral("The end date is before the first payment.");
+        return false;
+    }
+    r.type = c->type;
+    if (r.frequency != Frequency::Weekly) r.day = r.startDate.day();
+    const QString now = util::nowIso();
+    if (r.id.isEmpty()) r.id = util::newId();
+    if (r.createdAt.isEmpty()) r.createdAt = now;
+    r.updatedAt = now;
+
+    const Recurring *old = recurringRule(r.id);
+    if (!old) {
+        if (!r.nextDate.isValid()) r.nextDate = r.startDate; // first payment not recorded yet
+    } else {
+        const bool scheduleChanged = old->frequency != r.frequency || old->startDate != r.startDate;
+        if (!scheduleChanged) {
+            r.nextDate = old->nextDate;
+        } else if (recurringPostedCount(r.id) > 0) {
+            // Past payments are already recorded; continue the new schedule from today.
+            r.nextDate = recurrence::firstOnOrAfter(r, std::max(today, r.startDate));
+        } else {
+            r.nextDate = r.startDate;
+        }
+    }
+
+    if (!writeRecurring(r)) {
+        if (error) *error = m_db.lastError().text();
+        return false;
+    }
+    bool found = false;
+    for (auto &x : m_recurring)
+        if (x.id == r.id) {
+            x = r;
+            found = true;
+        }
+    if (!found) m_recurring.push_back(r);
+    sortRecurring();
+    markDirty();
+    if (processRecurring(today, false).isEmpty()) emit dataChanged();
+    return true;
+}
+
+bool Store::setRecurringActive(const QString &id, bool active, const QDate &today)
+{
+    const Recurring *old = recurringRule(id);
+    if (!old || old->active == active) return old != nullptr;
+    Recurring r = *old;
+    r.active = active;
+    r.updatedAt = util::nowIso();
+    // Resuming skips the payments that fell due while paused.
+    if (active && r.nextDate.isValid() && r.nextDate < today) r.nextDate = recurrence::firstOnOrAfter(r, today);
+    if (!writeRecurring(r)) return false;
+    for (auto &x : m_recurring)
+        if (x.id == id) x = r;
+    sortRecurring();
+    markDirty();
+    emit dataChanged();
+    return true;
+}
+
+bool Store::deleteRecurring(const QString &id, QString *error)
+{
+    m_db.transaction();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM recurring WHERE id = ?"));
+    q.addBindValue(id);
+    bool ok = q.exec();
+    if (ok) {
+        // Keep the payments already recorded, just unlink them.
+        q.prepare(QStringLiteral("UPDATE transactions SET recurring_id = NULL WHERE recurring_id = ?"));
+        q.addBindValue(id);
+        ok = q.exec();
+    }
+    if (!ok || !m_db.commit()) {
+        if (error) *error = q.lastError().text();
+        m_db.rollback();
+        return false;
+    }
+    m_recurring.erase(std::remove_if(m_recurring.begin(), m_recurring.end(), [&](const Recurring &r) { return r.id == id; }), m_recurring.end());
+    for (auto &t : m_transactions)
+        if (t.recurringId == id) t.recurringId.clear();
+    markDirty();
+    emit dataChanged();
+    return true;
+}
+
+QVector<Transaction> Store::processRecurring(const QDate &today, bool notify)
+{
+    QVector<Transaction> posted;
+    if (!m_db.isOpen()) return posted;
+    const QString now = util::nowIso();
+    m_db.transaction();
+    for (auto &r : m_recurring) {
+        if (!r.active || !category(r.categoryId)) continue;
+        bool changed = false;
+        int guard = 0;
+        while (r.nextDate.isValid() && r.nextDate <= today && !r.finished() && guard++ < 1000) {
+            Transaction t;
+            t.id = util::newId();
+            t.type = category(r.categoryId)->type;
+            t.categoryId = r.categoryId;
+            t.amount = r.amount;
+            t.date = r.nextDate;
+            t.description = r.description;
+            t.vendor = r.vendor;
+            t.paymentMethod = r.paymentMethod;
+            t.notes = r.notes;
+            t.createdAt = now;
+            t.updatedAt = now;
+            t.recurringId = r.id;
+            if (!writeTransaction(t)) break;
+            posted.push_back(t);
+            r.nextDate = recurrence::advance(r.nextDate, r.frequency, r.day);
+            changed = true;
+        }
+        if (changed) {
+            r.updatedAt = now;
+            writeRecurring(r);
+        }
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        loadCache();
+        return {};
+    }
+    if (posted.isEmpty()) return posted;
+    m_transactions += posted;
+    sortTransactions();
+    sortRecurring();
+    if (notify) m_autoPosted += posted;
+    markDirty();
+    emit dataChanged();
+    return posted;
+}
+
+QVector<std::pair<QDate, Recurring>> Store::upcoming(const QDate &from, const QDate &to) const
+{
+    QVector<std::pair<QDate, Recurring>> out;
+    for (const auto &r : m_recurring) {
+        if (!r.active) continue;
+        for (const QDate &d : recurrence::occurrences(r, from, to, 60)) out.push_back({d, r});
+    }
+    std::stable_sort(out.begin(), out.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    return out;
 }
 
 /* ---------------- Aggregations ---------------- */

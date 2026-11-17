@@ -19,8 +19,9 @@ Requires Windows 10 or 11 (64-bit).
 
 | Area | What you can do |
 |---|---|
-| **Dashboard** | See today's spending, this month's income, expenses and net profit (compared with last month), and year-to-date profit. It also shows an interactive income-vs-expenses chart (click a month to drill in), your top spending categories with budget progress, recent transactions and the last 7 days. |
+| **Dashboard** | See today's spending, this month's income, expenses and net profit (compared with last month), and year-to-date profit. It also shows an interactive income-vs-expenses chart (click a month to drill in), your top spending categories with budget progress, recent transactions, upcoming recurring payments and the last 7 days. |
 | **Transactions** | Record income or expenses for any day: amount, category, description, vendor or customer (auto-completed), payment method and notes. Attach receipts with a file picker or drag and drop. Large phone photos are shrunk automatically. Transactions are grouped by day with daily totals. You can filter by month, year or all time, by type and by category, and search the text. Right-click to edit, duplicate for today, view receipts or delete (several at once is supported). You can also export to CSV. |
+| **Recurring** | Set up regular bills and income once — rent, internet, insurance, salaries, subscriptions — weekly, monthly, every 3 months or yearly, with an optional end date. Each payment is **recorded automatically on its due date**; any that fell due while the app was closed are added the next time you open it. Tick **Repeat this transaction** when adding a transaction to turn it into a recurring one. Pause, resume, edit (future payments only) or delete rules; see your fixed costs per month and bills due in the next 30 days. The dashboard shows upcoming payments and tells you what was recorded automatically. |
 | **Categories** | Comes with 28 standard business categories (7 income, 21 expense). You can add, edit or delete categories, choose an icon, and set an optional monthly budget with over-budget warnings. If you delete a category that is in use, you choose whether to move its transactions to another category or delete them. |
 | **Reports** | **Monthly:** income and expenses by category with % share and budget, plus a daily breakdown. **Annual:** a category × month table with totals and net profit. **Year over year:** totals and the change from the previous year. Every report can be exported to CSV, saved as PDF or printed. |
 | **Backup & Restore** | Save a full backup as one `.json` file that includes your receipts, or a lighter backup without them. You can also turn on **automatic backups** when the app closes, saved to a folder you choose (a OneDrive or Dropbox folder works well) and keeping the last *N* copies. Restore by replacing all data, or by merging, which adds only what's missing. A reminder appears if you haven't backed up recently. |
@@ -29,7 +30,7 @@ Requires Windows 10 or 11 (64-bit).
 **Keyboard shortcuts:**
 - **Ctrl+N:** new transaction
 - **Ctrl+B:** back up now
-- **Ctrl+1 … Ctrl+6:** switch pages
+- **Ctrl+1 … Ctrl+7:** switch pages
 - **Del:** delete the selected transactions
 - **Ctrl+Enter:** save in the transaction dialog
 

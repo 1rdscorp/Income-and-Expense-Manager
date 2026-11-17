@@ -7,6 +7,7 @@
 #include <QSqlDatabase>
 #include <array>
 #include <functional>
+#include <utility>
 
 /* Owns the SQLite database and an in-memory cache of categories and transactions.
  * Receipts' binary data stays in the database and is loaded on demand. */
@@ -51,6 +52,23 @@ public:
     QVector<Receipt> receiptsFor(const QString &txId) const;
     QVector<Receipt> allReceipts() const;
 
+    // Recurring transactions
+    const QVector<Recurring> &recurring() const { return m_recurring; }
+    const Recurring *recurringRule(const QString &id) const;
+    int recurringPostedCount(const QString &id) const;
+    // Creates or updates a rule, then records any payments already due.
+    bool saveRecurring(const Recurring &r, QString *error = nullptr, const QDate &today = QDate::currentDate());
+    bool setRecurringActive(const QString &id, bool active, const QDate &today = QDate::currentDate());
+    // Deletes the rule; payments already recorded are kept.
+    bool deleteRecurring(const QString &id, QString *error = nullptr);
+    // Records every occurrence due on or before `today`. Returns the transactions created.
+    QVector<Transaction> processRecurring(const QDate &today = QDate::currentDate(), bool notify = true);
+    // Occurrences of active rules between the dates (inclusive), soonest first.
+    QVector<std::pair<QDate, Recurring>> upcoming(const QDate &from, const QDate &to) const;
+    // Transactions recorded automatically this session (for the dashboard notice).
+    const QVector<Transaction> &autoPosted() const { return m_autoPosted; }
+    void clearAutoPosted() { m_autoPosted.clear(); }
+
     // Bulk operations
     bool replaceAll(const BackupData &data, QString *error = nullptr);
     bool merge(const BackupData &data, MergeStats *stats, QString *error = nullptr);
@@ -83,6 +101,8 @@ private:
     bool writeCategory(const Category &c);
     bool writeTransaction(const Transaction &t);
     bool writeReceipt(const Receipt &r);
+    bool writeRecurring(const Recurring &r);
+    void sortRecurring();
     bool clearTables();
     void markDirty();
 
@@ -93,6 +113,8 @@ private:
     QHash<QString, int> m_catIndex;
     QVector<Transaction> m_transactions;
     QHash<QString, int> m_receiptCounts;
+    QVector<Recurring> m_recurring;
+    QVector<Transaction> m_autoPosted;
     qint64 m_receiptBytes = 0;
     bool m_dirty = false;
 };

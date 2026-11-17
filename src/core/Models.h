@@ -11,6 +11,34 @@ inline QString typeToString(TxType t) { return t == TxType::Income ? QStringLite
 inline TxType typeFromString(const QString &s) { return s == QLatin1String("income") ? TxType::Income : TxType::Expense; }
 inline QString typeLabel(TxType t) { return t == TxType::Income ? QStringLiteral("Income") : QStringLiteral("Expense"); }
 
+enum class Frequency { Weekly, Monthly, Quarterly, Yearly };
+
+inline QString frequencyToString(Frequency f)
+{
+    switch (f) {
+    case Frequency::Weekly: return QStringLiteral("weekly");
+    case Frequency::Quarterly: return QStringLiteral("quarterly");
+    case Frequency::Yearly: return QStringLiteral("yearly");
+    default: return QStringLiteral("monthly");
+    }
+}
+inline Frequency frequencyFromString(const QString &s)
+{
+    if (s == QLatin1String("weekly")) return Frequency::Weekly;
+    if (s == QLatin1String("quarterly")) return Frequency::Quarterly;
+    if (s == QLatin1String("yearly")) return Frequency::Yearly;
+    return Frequency::Monthly;
+}
+inline QString frequencyLabel(Frequency f)
+{
+    switch (f) {
+    case Frequency::Weekly: return QStringLiteral("Weekly");
+    case Frequency::Quarterly: return QStringLiteral("Every 3 months");
+    case Frequency::Yearly: return QStringLiteral("Yearly");
+    default: return QStringLiteral("Monthly");
+    }
+}
+
 struct Category {
     QString id;
     QString name;
@@ -32,8 +60,33 @@ struct Transaction {
     QString notes;
     QString createdAt;
     QString updatedAt;
+    QString recurringId; // set when created by a recurring rule
 
     qint64 signedAmount() const { return type == TxType::Income ? amount : -amount; }
+};
+
+/* A repeating transaction (rent, internet, salaries...). Occurrences are posted as
+ * normal transactions on their due date. */
+struct Recurring {
+    QString id;
+    TxType type = TxType::Expense;
+    QString categoryId;
+    qint64 amount = 0;
+    QString description;
+    QString vendor;
+    QString paymentMethod;
+    QString notes;
+    Frequency frequency = Frequency::Monthly;
+    int day = 1;        // day of month the payment falls on (clamped to short months)
+    QDate startDate;    // first occurrence
+    QDate endDate;      // invalid = no end
+    QDate nextDate;     // next occurrence not yet recorded
+    bool active = true; // paused rules record nothing
+    QString createdAt;
+    QString updatedAt;
+
+    bool finished() const { return endDate.isValid() && nextDate.isValid() && nextDate > endDate; }
+    QString title() const { return !description.isEmpty() ? description : vendor; }
 };
 
 struct Receipt {
@@ -77,6 +130,7 @@ struct BackupData {
     QVector<Category> categories;
     QVector<Transaction> transactions;
     QVector<Receipt> receipts;
+    QVector<Recurring> recurring;
     QString exportedAt;
 };
 
@@ -84,4 +138,5 @@ struct MergeStats {
     int categories = 0;
     int transactions = 0;
     int receipts = 0;
+    int recurring = 0;
 };

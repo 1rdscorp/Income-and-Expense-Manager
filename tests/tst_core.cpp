@@ -1,9 +1,12 @@
 #include "core/Backup.h"
 #include "core/Defaults.h"
+#include "core/Recurrence.h"
 #include "core/Reports.h"
 #include "core/Store.h"
 #include "core/Util.h"
 
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -188,11 +191,184 @@ private slots:
         QCOMPARE(t->categoryId, catId(QStringLiteral("Sales Revenue")));
     }
 
+
+    void recurrenceMath()
+    {
+        // Monthly on the 31st clamps to short months but returns to the 31st afterwards
+        QDate d(2026, 1, 31);
+        d = recurrence::advance(d, Frequency::Monthly, 31);
+        QCOMPARE(d, QDate(2026, 2, 28));
+        d = recurrence::advance(d, Frequency::Monthly, 31);
+        QCOMPARE(d, QDate(2026, 3, 31));
+        QCOMPARE(recurrence::advance(QDate(2028, 2, 29), Frequency::Yearly, 29), QDate(2029, 2, 28));
+        QCOMPARE(recurrence::advance(QDate(2026, 11, 15), Frequency::Quarterly, 15), QDate(2027, 2, 15));
+        QCOMPARE(recurrence::advance(QDate(2026, 11, 17), Frequency::Weekly, 17), QDate(2026, 11, 24));
+
+        Recurring r;
+        r.amount = 12000;
+        r.frequency = Frequency::Weekly;
+        QCOMPARE(recurrence::monthlyEquivalent(r), 52000);
+        r.frequency = Frequency::Yearly;
+        QCOMPARE(recurrence::monthlyEquivalent(r), 1000);
+        r.frequency = Frequency::Monthly;
+        r.day = 1;
+        QCOMPARE(recurrence::describe(r), QStringLiteral("Monthly on the 1st"));
+        r.day = 22;
+        QCOMPARE(recurrence::describe(r), QStringLiteral("Monthly on the 22nd"));
+        r.day = 13;
+        QCOMPARE(recurrence::describe(r), QStringLiteral("Monthly on the 13th"));
+    }
+
+    void recurringCatchUpAndSchedule()
+    {
+        Store &s = store();
+        const int before = s.transactions().size();
+        Recurring rent;
+        rent.categoryId = catId(QStringLiteral("Rent & Lease"));
+        rent.amount = 180000;
+        rent.description = QStringLiteral("Shop rent");
+        rent.startDate = QDate(2026, 8, 1);
+        QString err;
+        // "today" is 17 Nov: Aug, Sep, Oct and Nov payments are due and get recorded at once
+        QVERIFY2(s.saveRecurring(rent, &err, QDate(2026, 11, 17)), qPrintable(err));
+        QCOMPARE(s.recurring().size(), 1);
+        const Recurring r = s.recurring().first();
+        QCOMPARE(r.nextDate, QDate(2026, 12, 1));
+        QCOMPARE(r.day, 1);
+        QCOMPARE(s.recurringPostedCount(r.id), 4);
+        QCOMPARE(s.transactions().size(), before + 4);
+        QCOMPARE(s.autoPosted().size(), 0); // user-created catch-up is not an "automatic" notice
+
+        // Nothing more until the next due date; then exactly one
+        QCOMPARE(s.processRecurring(QDate(2026, 11, 30)).size(), 0);
+        const auto posted = s.processRecurring(QDate(2026, 12, 1));
+        QCOMPARE(posted.size(), 1);
+        QCOMPARE(posted[0].date, QDate(2026, 12, 1));
+        QCOMPARE(posted[0].recurringId, r.id);
+        QCOMPARE(posted[0].type, TxType::Expense);
+        QCOMPARE(s.autoPosted().size(), 1);
+        s.clearAutoPosted();
+
+        // Upcoming list
+        const auto up = s.upcoming(QDate(2026, 12, 2), QDate(2027, 3, 1));
+        QCOMPARE(up.size(), 3); // Jan, Feb, Mar
+        QCOMPARE(up.first().first, QDate(2027, 1, 1));
+
+        // Pausing stops payments; resuming skips the paused period
+        QVERIFY(s.setRecurringActive(r.id, false));
+        QCOMPARE(s.processRecurring(QDate(2027, 3, 10)).size(), 0);
+        QVERIFY(s.setRecurringActive(r.id, true, QDate(2027, 3, 10)));
+        QCOMPARE(s.recurringRule(r.id)->nextDate, QDate(2027, 4, 1));
+
+        // Editing the amount keeps the schedule; past payments are untouched
+        Recurring edit = *s.recurringRule(r.id);
+        edit.amount = 190000;
+        QVERIFY(s.saveRecurring(edit, &err, QDate(2027, 3, 10)));
+        QCOMPARE(s.recurringRule(r.id)->nextDate, QDate(2027, 4, 1));
+        QCOMPARE(s.processRecurring(QDate(2027, 4, 1)).first().amount, 190000);
+
+        // End date stops the series
+        edit = *s.recurringRule(r.id);
+        edit.endDate = QDate(2027, 5, 15);
+        QVERIFY(s.saveRecurring(edit, &err, QDate(2027, 4, 2)));
+        QCOMPARE(s.processRecurring(QDate(2027, 12, 31)).size(), 1); // only May
+        QVERIFY(s.recurringRule(r.id)->finished());
+
+        // Invalid rules are rejected
+        Recurring bad;
+        bad.categoryId = catId(QStringLiteral("Utilities"));
+        bad.startDate = QDate(2026, 1, 1);
+        QVERIFY(!s.saveRecurring(bad, &err)); // no amount
+        bad.amount = 100;
+        bad.endDate = QDate(2025, 1, 1);
+        QVERIFY(!s.saveRecurring(bad, &err)); // ends before it starts
+    }
+
+    void recurringSurvivesBackupAndCategoryMove()
+    {
+        Store &s = store();
+        QString err;
+        Recurring net;
+        net.categoryId = catId(QStringLiteral("Telephone & Internet"));
+        net.amount = 8900;
+        net.description = QStringLiteral("Internet");
+        net.startDate = QDate(2026, 11, 5);
+        QVERIFY(s.saveRecurring(net, &err, QDate(2026, 11, 17)));
+        const int rules = s.recurring().size();
+
+        BackupData d;
+        QVERIFY(backup::parse(backup::toJson(s, false), &d, &err));
+        QCOMPARE(d.recurring.size(), rules);
+        int linked = 0;
+        for (const auto &t : d.transactions)
+            if (!t.recurringId.isEmpty()) ++linked;
+        QVERIFY(linked >= 6);
+
+        // Moving a category moves its recurring rules too
+        Category phone;
+        phone.name = QStringLiteral("Phone & Data");
+        QVERIFY(s.saveCategory(phone, &err));
+        const QString phoneId = catId(QStringLiteral("Phone & Data"));
+        QVERIFY(s.deleteCategory(catId(QStringLiteral("Telephone & Internet")), phoneId, &err));
+        bool moved = false;
+        for (const auto &r : s.recurring())
+            if (r.description == QLatin1String("Internet")) moved = r.categoryId == phoneId;
+        QVERIFY(moved);
+
+        // Deleting a rule keeps its recorded payments
+        QString netId;
+        for (const auto &r : s.recurring())
+            if (r.description == QLatin1String("Internet")) netId = r.id;
+        const int txBefore = s.transactions().size();
+        QVERIFY(s.deleteRecurring(netId, &err));
+        QCOMPARE(s.transactions().size(), txBefore);
+        QCOMPARE(s.recurringPostedCount(netId), 0);
+
+        // Restore brings the rules back
+        QVERIFY(s.replaceAll(d, &err));
+        QCOMPARE(s.recurring().size(), rules);
+    }
+
+    void upgradesVersion10Database()
+    {
+        // A v1.0 database has no recurring table or recurring_id column
+        QTemporaryDir dir;
+        {
+            QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("old"));
+            db.setDatabaseName(dir.filePath(QStringLiteral("ledgerly.db")));
+            QVERIFY(db.open());
+            QSqlQuery q(db);
+            QVERIFY(q.exec(QStringLiteral("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")));
+            QVERIFY(q.exec(QStringLiteral("INSERT INTO meta VALUES('initialized','1')")));
+            QVERIFY(q.exec(QStringLiteral("CREATE TABLE categories (id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, icon TEXT, budget INTEGER NOT NULL DEFAULT 0, created_at TEXT)")));
+            QVERIFY(q.exec(QStringLiteral("INSERT INTO categories VALUES('c1','Rent','expense','x',0,'')")));
+            QVERIFY(q.exec(QStringLiteral("CREATE TABLE transactions (id TEXT PRIMARY KEY, type TEXT NOT NULL, category_id TEXT, amount INTEGER NOT NULL, date TEXT NOT NULL, description TEXT, vendor TEXT, payment_method TEXT, notes TEXT, created_at TEXT, updated_at TEXT)")));
+            QVERIFY(q.exec(QStringLiteral("INSERT INTO transactions VALUES('t1','expense','c1',5000,'2026-10-01','old','','','','','')")));
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(QStringLiteral("old"));
+        const QString mainDir = store().dataDir();
+        QString err;
+        QVERIFY2(store().open(dir.path(), &err), qPrintable(err));
+        QCOMPARE(store().transactions().size(), 1);
+        QCOMPARE(store().transactions().first().description, QStringLiteral("old"));
+        Recurring r;
+        r.categoryId = QStringLiteral("c1");
+        r.amount = 5000;
+        r.startDate = QDate(2026, 11, 1);
+        QVERIFY2(store().saveRecurring(r, &err, QDate(2026, 11, 17)), qPrintable(err));
+        QCOMPARE(store().transactions().size(), 2);
+        // reopen the main test database
+        QVERIFY(store().open(mainDir, &err));
+    }
+
     void sampleData()
     {
         QString err;
         QVERIFY(store().eraseAll(&err));
         QVERIFY(store().loadSampleData() > 100);
+        QCOMPARE(store().recurring().size(), 6);
+        for (const auto &r : store().recurring()) QVERIFY(r.nextDate > QDate::currentDate());
         QCOMPARE(store().loadSampleData(), 0); // only once
     }
 

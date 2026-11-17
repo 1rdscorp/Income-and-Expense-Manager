@@ -3,6 +3,7 @@
 #include "core/Models.h"
 #include <QDialog>
 
+class QCheckBox;
 class QComboBox;
 class QDateEdit;
 class QLabel;
@@ -66,4 +67,9 @@ private:
     QPushButton *m_deleteBtn;
     QPushButton *m_anotherBtn;
     QPushButton *m_saveBtn;
+    QWidget *m_repeatRow;
+    QCheckBox *m_repeat;
+    QComboBox *m_repeatFreq;
+    QLabel *m_repeatHint;
+    QLabel *m_seriesNote;
 };

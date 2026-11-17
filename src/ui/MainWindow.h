@@ -9,6 +9,7 @@ class QPushButton;
 class DashboardPage;
 class TransactionsPage;
 class CategoriesPage;
+class RecurringPage;
 class ReportsPage;
 class BackupPage;
 class SettingsPage;
@@ -17,7 +18,7 @@ class MainWindow : public QMainWindow
 {
     Q_OBJECT
 public:
-    enum PageId { Dashboard, Transactions, Categories, Reports, Backup, Settings, PageCount };
+    enum PageId { Dashboard, Transactions, Categories, Recurring, Reports, Backup, Settings, PageCount };
 
     explicit MainWindow(QWidget *parent = nullptr);
 
@@ -51,6 +52,7 @@ private:
     DashboardPage *m_dashboard = nullptr;
     TransactionsPage *m_transactions = nullptr;
     CategoriesPage *m_categories = nullptr;
+    RecurringPage *m_recurring = nullptr;
     ReportsPage *m_reports = nullptr;
     BackupPage *m_backup = nullptr;
     SettingsPage *m_settings = nullptr;

@@ -221,6 +221,7 @@ void TransactionsPage::updateList()
     m_tree->clear();
     QFont bold = m_tree->font();
     bold.setWeight(QFont::DemiBold);
+    const QIcon recurIcon(Theme::iconPixmap(QStringLiteral("repeat"), th.accent, 14));
     QTreeWidgetItem *group = nullptr;
     QDate groupDate;
     Totals dayTotals;
@@ -251,6 +252,10 @@ void TransactionsPage::updateList()
         const Category c = s.categoryOrUnknown(x.categoryId);
         auto *it = new QTreeWidgetItem(group);
         it->setText(ColDesc, x.description.isEmpty() ? (x.vendor.isEmpty() ? c.name : x.vendor) : x.description);
+        if (!x.recurringId.isEmpty()) {
+            it->setIcon(ColDesc, recurIcon);
+            it->setToolTip(ColDesc, QStringLiteral("Recurring payment — recorded automatically") + (x.notes.isEmpty() ? QString() : QStringLiteral("\n\n") + x.notes));
+        }
         if (!x.notes.isEmpty()) it->setToolTip(ColDesc, x.notes);
         it->setText(ColCategory, c.icon + QStringLiteral("  ") + c.name);
         it->setText(ColVendor, x.vendor);

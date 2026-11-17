@@ -9,6 +9,8 @@ class HBarList;
 class KpiCard;
 class QTreeWidget;
 class QWidget;
+class QLabel;
+class QFrame;
 
 class DashboardPage : public QWidget
 {
@@ -37,5 +39,9 @@ private:
     HBarList *m_top;
     QTreeWidget *m_recent;
     HBarList *m_week;
+    QTreeWidget *m_upcoming;
+    QLabel *m_upcomingEmpty;
+    QFrame *m_autoBanner;
+    QLabel *m_autoText;
     int m_chartYear = 0;
 };

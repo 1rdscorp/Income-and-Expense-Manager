@@ -3,6 +3,8 @@
 #include "ui/BackupPage.h"
 #include "ui/CategoryDialog.h"
 #include "ui/MainWindow.h"
+#include "ui/RecurringDialog.h"
+#include "ui/RecurringPage.h"
 #include "ui/ReportsPage.h"
 #include "ui/Theme.h"
 #include "ui/TransactionDialog.h"
@@ -10,6 +12,8 @@
 
 #include <QAbstractButton>
 #include <QApplication>
+#include <QCheckBox>
+#include <QLabel>
 #include <QBuffer>
 #include <QComboBox>
 #include <QDateEdit>
@@ -186,6 +190,77 @@ private slots:
         QCOMPARE(c->budget, 15000);
     }
 
+
+    void repeatTransactionMonthly()
+    {
+        Store &s = Store::instance();
+        const int rulesBefore = s.recurring().size();
+        const QDate first = QDate::currentDate().addMonths(-2);
+        TransactionDialog dlg;
+        dlg.setNewType(TxType::Expense);
+        dlg.findChild<QLineEdit *>(QStringLiteral("amountEdit"))->setText(QStringLiteral("89"));
+        auto *cat = dlg.findChild<QComboBox *>(QStringLiteral("categoryCombo"));
+        cat->setCurrentIndex(cat->findData(categoryId(QStringLiteral("Telephone & Internet"))));
+        dlg.findChild<QLineEdit *>(QStringLiteral("descEdit"))->setText(QStringLiteral("Business internet"));
+        dlg.findChild<QDateEdit *>(QStringLiteral("dateEdit"))->setDate(first);
+        auto *repeat = dlg.findChild<QCheckBox *>(QStringLiteral("repeatCheck"));
+        QVERIFY(repeat && repeat->isVisible() == false); // dialog not shown, but the row exists
+        repeat->setChecked(true);
+        buttonByAccessibleName(&dlg, QStringLiteral("save"))->click();
+        QCOMPARE(dlg.outcome(), TransactionDialog::Saved);
+
+        QCOMPARE(s.recurring().size(), rulesBefore + 1);
+        const Recurring *rule = nullptr;
+        for (const auto &r : s.recurring())
+            if (r.description == QLatin1String("Business internet")) rule = &r;
+        QVERIFY(rule);
+        QCOMPARE(rule->frequency, Frequency::Monthly);
+        QCOMPARE(rule->startDate, first);
+        // the original payment plus the two months since have been recorded
+        QCOMPARE(s.recurringPostedCount(rule->id), 3);
+        QVERIFY(rule->nextDate > QDate::currentDate());
+
+        // Editing one of the payments shows that it belongs to the series
+        Transaction posted;
+        for (const auto &t : s.transactions())
+            if (t.recurringId == rule->id) posted = t;
+        TransactionDialog edit;
+        edit.setTransaction(posted);
+        bool noted = false;
+        for (auto *l : edit.findChildren<QLabel *>())
+            if (l->text().contains(QStringLiteral("Recorded automatically"))) noted = !l->isHidden();
+        QVERIFY(noted);
+        QVERIFY(edit.findChild<QCheckBox *>(QStringLiteral("repeatCheck"))->parentWidget()->isHidden());
+    }
+
+    void recurringDialogFutureStart()
+    {
+        Store &s = Store::instance();
+        const QDate start = QDate(QDate::currentDate().year(), QDate::currentDate().month(), 1).addMonths(1);
+        const int txBefore = s.transactions().size();
+        RecurringDialog dlg;
+        dlg.findChild<QLineEdit *>(QStringLiteral("amountEdit"))->setText(QStringLiteral("1,800"));
+        auto *cat = dlg.findChild<QComboBox *>(QStringLiteral("categoryCombo"));
+        cat->setCurrentIndex(cat->findData(categoryId(QStringLiteral("Rent & Lease"))));
+        dlg.findChild<QLineEdit *>(QStringLiteral("descEdit"))->setText(QStringLiteral("Shop rent"));
+        dlg.findChild<QDateEdit *>(QStringLiteral("startDate"))->setDate(start);
+        buttonByAccessibleName(&dlg, QStringLiteral("save"))->click();
+        QCOMPARE(dlg.result(), int(QDialog::Accepted));
+        QCOMPARE(s.transactions().size(), txBefore); // nothing due yet
+        const Recurring *rule = nullptr;
+        for (const auto &r : s.recurring())
+            if (r.description == QLatin1String("Shop rent")) rule = &r;
+        QVERIFY(rule);
+        QCOMPARE(rule->amount, 180000);
+        QCOMPARE(rule->nextDate, start);
+        QCOMPARE(rule->day, 1);
+
+        // It appears on the Recurring page and in the 30-day outlook when within range
+        RecurringPage page;
+        page.refresh();
+        QCOMPARE(page.findChild<QTableWidget *>()->rowCount(), s.recurring().size());
+    }
+
     void mainWindowPages()
     {
         QCOMPARE(Store::instance().loadSampleData(), 0); // only when empty — we have data
@@ -199,8 +274,11 @@ private slots:
         QDate today = QDate::currentDate();
         tp->showMonth(today.year(), today.month());
         auto *tree = tp->findChild<QTreeWidget *>();
-        QCOMPARE(tree->topLevelItemCount(), 1); // one day group (today)
-        QCOMPARE(tree->topLevelItem(0)->childCount(), Store::instance().transactions().size());
+        int inMonth = 0, children = 0;
+        for (const auto &t : Store::instance().transactions())
+            if (t.date.year() == today.year() && t.date.month() == today.month()) ++inMonth;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i) children += tree->topLevelItem(i)->childCount();
+        QCOMPARE(children, inMonth);
 
         // Data changes refresh the visible page
         w.showPage(MainWindow::Transactions);
@@ -210,7 +288,9 @@ private slots:
         t.amount = 100000;
         t.date = today;
         QVERIFY(Store::instance().saveTransaction(t, {}, {}, &err));
-        QCOMPARE(tree->topLevelItem(0)->childCount(), Store::instance().transactions().size());
+        children = 0;
+        for (int i = 0; i < tree->topLevelItemCount(); ++i) children += tree->topLevelItem(i)->childCount();
+        QCOMPARE(children, inMonth + 1);
 
         auto *rp = qobject_cast<ReportsPage *>(w.pageWidget(MainWindow::Reports));
         w.showPage(MainWindow::Reports);

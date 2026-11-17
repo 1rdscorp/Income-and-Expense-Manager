@@ -3,6 +3,7 @@
 #include "BackupPage.h"
 #include "CategoriesPage.h"
 #include "DashboardPage.h"
+#include "RecurringPage.h"
 #include "ReportsPage.h"
 #include "SettingsPage.h"
 #include "Theme.h"
@@ -25,6 +26,7 @@
 #include <QScrollArea>
 #include <QSettings>
 #include <QStackedWidget>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -34,7 +36,7 @@ struct NavItem {
     const char *icon;
 };
 const NavItem kNav[] = {
-    {"Dashboard", "dashboard"}, {"Transactions", "list"}, {"Categories", "tag"},
+    {"Dashboard", "dashboard"}, {"Transactions", "list"}, {"Categories", "tag"}, {"Recurring", "repeat"},
     {"Reports", "chart"},       {"Backup & Restore", "database"}, {"Settings", "settings"},
 };
 
@@ -130,13 +132,15 @@ MainWindow::MainWindow(QWidget *parent)
     m_dashboard = new DashboardPage;
     m_transactions = new TransactionsPage;
     m_categories = new CategoriesPage;
+    m_recurring = new RecurringPage;
     m_reports = new ReportsPage;
     m_backup = new BackupPage;
     m_settings = new SettingsPage;
-    m_pages = {m_dashboard, m_transactions, m_categories, m_reports, m_backup, m_settings};
+    m_pages = {m_dashboard, m_transactions, m_categories, m_recurring, m_reports, m_backup, m_settings};
     m_stack->addWidget(scrollWrap(m_dashboard));
     m_stack->addWidget(m_transactions);
     m_stack->addWidget(m_categories);
+    m_stack->addWidget(m_recurring);
     m_stack->addWidget(scrollWrap(m_reports));
     m_stack->addWidget(scrollWrap(m_backup));
     m_stack->addWidget(scrollWrap(m_settings));
@@ -176,6 +180,12 @@ MainWindow::MainWindow(QWidget *parent)
         onData();
     });
 
+    // Record recurring payments as they fall due while the app stays open (e.g. overnight).
+    auto *recurTimer = new QTimer(this);
+    recurTimer->setInterval(5 * 60 * 1000);
+    connect(recurTimer, &QTimer::timeout, this, []() { Store::instance().processRecurring(); });
+    recurTimer->start();
+
     QSettings ws = windowSettings();
     if (!restoreGeometry(ws.value(QStringLiteral("geometry")).toByteArray())) resize(1320, 860);
 
@@ -188,6 +198,10 @@ void MainWindow::buildMenus()
     QMenu *file = menuBar()->addMenu(QStringLiteral("&File"));
     QAction *a = file->addAction(QStringLiteral("&New transaction…"), this, &MainWindow::newTransaction);
     a->setShortcut(QKeySequence::New);
+    file->addAction(QStringLiteral("New &recurring transaction…"), this, [this]() {
+        showPage(Recurring);
+        m_recurring->addRule();
+    });
     file->addSeparator();
     a = file->addAction(QStringLiteral("&Back up now…"), this, [this]() { m_backup->backupNow(true); });
     a->setShortcut(QKeySequence(QStringLiteral("Ctrl+B")));
