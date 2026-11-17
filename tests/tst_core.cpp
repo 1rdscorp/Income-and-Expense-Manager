@@ -1,6 +1,7 @@
 #include "core/Backup.h"
 #include "core/BankImport.h"
 #include "core/Defaults.h"
+#include "core/Institutions.h"
 #include "core/Recurrence.h"
 #include "core/Reports.h"
 #include "core/SimpleFin.h"
@@ -648,10 +649,9 @@ private slots:
         QCOMPARE(items[0].tx.categoryId, catId(QStringLiteral("Repairs & Maintenance")));
 
         // Flip signs (card statements that show charges as positive)
-        card.flipSigns = true;
         lines.clear();
         line(21, 2500, "UBER TRIP 0042", "ofx:C1");
-        items = bank::prepare(s, card, lines);
+        items = bank::prepare(s, card, lines, true);
         QCOMPARE(items[0].tx.type, TxType::Expense);
         QCOMPARE(items[0].tx.categoryId, catId(QStringLiteral("Travel")));
 
@@ -659,6 +659,85 @@ private slots:
         QVERIFY(s.deleteAccount(accId, &err));
         QCOMPARE(s.accountTransactionCount(accId), 0);
         QVERIFY(s.transactions().size() > 3);
+    }
+
+
+    void wellsFargoAndAmexStatements()
+    {
+        Store &s = store();
+        QString err, wfId, amexId;
+        // Wells Fargo CSV: no header row; ambiguous dates must read as 3-6 Nov, not 11 Mar-Jun
+        const QByteArray wf =
+            "\"11/03/2026\",\"-61.40\",\"*\",\"\",\"PURCHASE AUTHORIZED ON 11/01 SHELL OIL 57444 HOUSTON TX S386305123456789 CARD 1234\"\n"
+            "\"11/04/2026\",\"1850.00\",\"*\",\"\",\"EDEPOSIT IN BRANCH/STORE 11/04/26 10:12:44 AM 1234 MAIN ST\"\n"
+            "\"11/05/2026\",\"-500.00\",\"*\",\"\",\"AMERICAN EXPRESS ACH PMT 261105 W1234 RDS BUSINESS\"\n"
+            "\"11/06/2026\",\"-72.35\",\"*\",\"\",\"CITY OF HOUSTON WATER BILL PAY\"\n";
+        auto r = bank::parseData(wf, QStringLiteral("Checking1.csv"));
+        QVERIFY2(r.ok(), qPrintable(r.error));
+        QCOMPARE(r.lines.size(), 4);
+        QCOMPARE(r.lines[0].date, QDate(2026, 11, 3));
+        QCOMPARE(r.lines[0].amount, -6140);
+        QCOMPARE(bank::cleanDescription(r.lines[0].description), QStringLiteral("Shell Oil Houston Tx"));
+
+        const auto *preset = institutions::find(QStringLiteral("wells-bank"));
+        QVERIFY(preset && preset->kind == QLatin1String("bank"));
+        Account wfAcc;
+        wfAcc.name = preset->accountName;
+        QVERIFY(s.saveAccount(wfAcc, &err, &wfId));
+        auto items = bank::prepare(s, *s.account(wfId), r.lines, bank::flipApplies(*s.account(wfId), r.format));
+        QCOMPARE(items[1].tx.type, TxType::Income);
+        QCOMPARE(items[2].status, bank::Proposed::Status::Ignored); // paying the Amex bill: a transfer, not an expense
+        QVERIFY(items[2].note.contains(QStringLiteral("card payment")));
+        QCOMPARE(items[3].status, bank::Proposed::Status::New);     // an ordinary bill is not mistaken for a transfer
+        QCOMPARE(bank::commit(s, items, &err), 3);
+
+        // American Express CSV: header, charges positive, payments negative, own reference ids
+        const QByteArray amex =
+            "Date,Description,Amount,Extended Details,Appears On Your Statement As,Address,City/State,Zip Code,Country,Reference,Category\n"
+            "11/02/2026,AMAZON MARKETPLACE NA PA,54.21,\"Amazon order\",AMAZON MARKETPLACE,,SEATTLE WA,98109,UNITED STATES,'320263060012345678',Merchandise\n"
+            "11/03/2026,DELTA AIR LINES ATLANTA,412.30,,DELTA AIR LINES,,ATLANTA GA,30320,UNITED STATES,'320263070023456789',Travel-Airline\n"
+            "11/05/2026,AUTOPAY PAYMENT - THANK YOU,-500.00,,AUTOPAY PAYMENT,,,,,'320263090034567890',\n"
+            "11/06/2026,GOOGLE *WORKSPACE,12.00,,GOOGLE *WORKSPACE,,,,,'320263100045678901',Business Services\n";
+        r = bank::parseData(amex, QStringLiteral("activity.csv"));
+        QVERIFY2(r.ok(), qPrintable(r.error));
+        QCOMPARE(r.lines.size(), 4);
+        QCOMPARE(r.lines[0].externalId, QStringLiteral("csv:320263060012345678"));
+        QCOMPARE(r.lines[0].date, QDate(2026, 11, 2));
+
+        const auto *amexPreset = institutions::find(QStringLiteral("amex-card"));
+        QVERIFY(amexPreset && amexPreset->csvChargesPositive && amexPreset->kind == QLatin1String("card"));
+        Account amexAcc;
+        amexAcc.name = amexPreset->accountName;
+        amexAcc.kind = amexPreset->kind;
+        QVERIFY(s.saveAccount(amexAcc, &err, &amexId));
+        // Even without the preset's setting, a card statement that is mostly "income" is recognised
+        QVERIFY(bank::chargesLookPositive(*s.account(amexId), r.lines));
+        QVERIFY(!bank::flipApplies(*s.account(amexId), r.format));
+        items = bank::prepare(s, *s.account(amexId), r.lines, true);
+        QCOMPARE(items[0].tx.type, TxType::Expense);
+        QCOMPARE(items[0].tx.amount, 5421);
+        QCOMPARE(items[1].tx.categoryId, catId(QStringLiteral("Travel")));
+        QCOMPARE(items[2].status, bank::Proposed::Status::Ignored);  // card side of the same payment
+        QCOMPARE(bank::commit(s, items, &err), 3);
+
+        // Overlapping next download: Amex reference ids prevent duplicates
+        const QByteArray amex2 =
+            "Date,Description,Amount,Reference\n11/06/2026,GOOGLE *WORKSPACE,12.00,'320263100045678901'\n11/09/2026,UBER TRIP,23.10,'320263130056789012'\n";
+        r = bank::parseData(amex2, QStringLiteral("activity2.csv"));
+        items = bank::prepare(s, *s.account(amexId), r.lines, true);
+        QCOMPARE(items[0].status, bank::Proposed::Status::Duplicate);
+        QCOMPARE(items[1].status, bank::Proposed::Status::New);
+
+        // OFX files never get the CSV sign swap
+        Account flipped = *s.account(amexId);
+        flipped.flipSigns = true;
+        QVERIFY(bank::flipApplies(flipped, QStringLiteral("CSV")));
+        QVERIFY(!bank::flipApplies(flipped, QStringLiteral("OFX")));
+
+        QVERIFY(!bank::looksLikeTransfer(QStringLiteral("GEICO ACH PMT")));
+        QVERIFY(!bank::looksLikeTransfer(QStringLiteral("CITY EPAYMENT WATER")));
+        QVERIFY(bank::looksLikeTransfer(QStringLiteral("ONLINE TRANSFER TO SAVINGS XXXXXX1234")));
+        QVERIFY(bank::looksLikeTransfer(QStringLiteral("WELLS FARGO CARD ONLINE PMT")));
     }
 
     void bankAutoImportFolder()

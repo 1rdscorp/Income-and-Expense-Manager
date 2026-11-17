@@ -316,7 +316,7 @@ DownloadResult download(Store &store, bool force, int minHours)
         for (const RemoteAccount &ra : set.accounts) {
             const Account *acc = store.account(links.value(ra.id).toString());
             if (!acc || ra.lines.isEmpty()) continue;
-            const auto items = bank::prepare(store, *acc, ra.lines);
+            const auto items = bank::prepare(store, *acc, ra.lines, false); // amounts are already signed: - = money out
             QString cerr;
             const int n = bank::commit(store, items, &cerr);
             if (n < 0) {

@@ -6,6 +6,7 @@
 #include "Widgets.h"
 #include "core/BankImport.h"
 #include "core/SimpleFin.h"
+#include "core/Institutions.h"
 #include "core/Store.h"
 #include "core/Util.h"
 
@@ -21,6 +22,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSet>
 #include <QShortcut>
 #include <QTableWidget>
 #include <QVBoxLayout>
@@ -60,7 +62,7 @@ BankPage::BankPage(QWidget *parent)
     root->addLayout(bar);
 
     // Live connection (SimpleFIN Bridge)
-    auto *live = new Card(QStringLiteral("Automatic bank connection"), QStringLiteral("U.S. Bank and most U.S. banks & cards, via SimpleFIN Bridge"));
+    auto *live = new Card(QStringLiteral("Automatic bank connection"), QStringLiteral("U.S. Bank, Wells Fargo, American Express and most U.S. banks & cards, via SimpleFIN Bridge"));
     m_liveStatus = new QLabel;
     m_liveStatus->setWordWrap(true);
     m_liveStatus->setTextFormat(Qt::RichText);
@@ -137,8 +139,22 @@ BankPage::BankPage(QWidget *parent)
     howText->setWordWrap(true);
     howText->setTextFormat(Qt::RichText);
     how->body()->addWidget(howText);
-    how->body()->addWidget(ui::muted(QStringLiteral("U.S. Bank: in online banking open the account → Download transactions → choose "
-                                                    "“Quicken (QFX)”, “QuickBooks (QBO)” or “Spreadsheet (CSV)”.")));
+    {
+        QString html;
+        QSet<QString> seen;
+        for (const auto &i : institutions::all()) {
+            const QString bankName = i.label.section(QStringLiteral(" — "), 0, 0);
+            if (seen.contains(bankName)) continue;
+            seen.insert(bankName);
+            html += QStringLiteral("<p style='margin:4px 0'><b>%1:</b> %2</p>").arg(bankName.toHtmlEscaped(), i.downloadSteps.toHtmlEscaped());
+        }
+        auto *banks = new QLabel(html);
+        banks->setWordWrap(true);
+        banks->setTextFormat(Qt::RichText);
+        how->body()->addWidget(banks);
+        how->body()->addWidget(ui::muted(QStringLiteral("Paying a card from your bank account appears on both statements; Ledgerly recognises card payments "
+                                                        "and transfers and leaves them unticked so they aren't counted twice.")));
+    }
     root->addWidget(how);
     root->addStretch(1);
 
@@ -314,8 +330,8 @@ void BankPage::connectBank()
     auto *steps = new QLabel(QStringLiteral(
         "<ol style='margin-left:-18px'>"
         "<li>Open <a href='https://bridge.simplefin.org'>bridge.simplefin.org</a>, create an account and subscribe (about $15/year).</li>"
-        "<li>Add your bank there: search for <b>U.S. Bank</b> and sign in (repeat for each bank or card issuer). "
-        "Check your bank is supported before paying.</li>"
+        "<li>Add your banks there: search for <b>U.S. Bank</b>, <b>Wells Fargo</b> and <b>American Express</b> and sign in to each. "
+        "Check they're supported before paying.</li>"
         "<li>Create a <b>Setup Token</b> for a new app connection (name it “Ledgerly”) and copy it.</li>"
         "<li>Paste the token below. It can be used only once.</li></ol>"));
     steps->setTextFormat(Qt::RichText);

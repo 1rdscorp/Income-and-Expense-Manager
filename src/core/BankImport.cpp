@@ -13,6 +13,7 @@
 #include <QRegularExpression>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace bank {
 
@@ -100,6 +101,11 @@ const Keyword kKeywords[] = {
     {"chevron", "Vehicle & Fuel"},  {"exxon", "Vehicle & Fuel"},    {"bp ", "Vehicle & Fuel"},       {"parking", "Vehicle & Fuel"},
     {"uber", "Travel"},             {"lyft", "Travel"},             {"airline", "Travel"},           {"airways", "Travel"},
     {"hotel", "Travel"},            {"airbnb", "Travel"},           {"booking.com", "Travel"},       {"expedia", "Travel"},
+    {"air lines", "Travel"},        {"airlines", "Travel"},         {"delta air", "Travel"},         {"southwest", "Travel"},
+    {"jetblue", "Travel"},          {"alaska air", "Travel"},       {"spirit air", "Travel"},        {"frontier air", "Travel"},
+    {"amtrak", "Travel"},           {"marriott", "Travel"},         {"hilton", "Travel"},            {"hyatt", "Travel"},
+    {"hertz", "Vehicle & Fuel"},    {"avis", "Vehicle & Fuel"},     {"enterprise rent", "Vehicle & Fuel"},
+    {"exxonmobil", "Vehicle & Fuel"}, {"valero", "Vehicle & Fuel"}, {"speedway", "Vehicle & Fuel"},  {"circle k", "Vehicle & Fuel"},
     {"restaurant", "Meals & Entertainment"}, {"cafe", "Meals & Entertainment"}, {"coffee", "Meals & Entertainment"},
     {"starbucks", "Meals & Entertainment"},  {"mcdonald", "Meals & Entertainment"}, {"doordash", "Meals & Entertainment"},
     {"ubereats", "Meals & Entertainment"},   {"grubhub", "Meals & Entertainment"},
@@ -152,6 +158,7 @@ QString CsvMapping::toJson() const
     o[QStringLiteral("debit")] = debit;
     o[QStringLiteral("credit")] = credit;
     o[QStringLiteral("memo")] = memo;
+    o[QStringLiteral("reference")] = reference;
     o[QStringLiteral("dateFormat")] = dateFormat;
     return QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact));
 }
@@ -170,6 +177,7 @@ CsvMapping CsvMapping::fromJson(const QString &json)
     m.debit = o.value(QStringLiteral("debit")).toInt(-1);
     m.credit = o.value(QStringLiteral("credit")).toInt(-1);
     m.memo = o.value(QStringLiteral("memo")).toInt(-1);
+    m.reference = o.value(QStringLiteral("reference")).toInt(-1);
     m.dateFormat = o.value(QStringLiteral("dateFormat")).toString();
     return m;
 }
@@ -202,19 +210,38 @@ QString detectDateFormat(const QStringList &samples, int preferMonthFirst)
             return a.startsWith(QLatin1Char('M')) && !b.startsWith(QLatin1Char('M')) && a.size() == b.size();
         });
     }
-    QString best;
-    int bestCount = 0;
+    // Several formats can read every value (11/03 = 3 Nov or 11 Mar). A statement covers a
+    // short period that isn't in the future, so prefer the reading with no future dates and
+    // the smallest spread; the locale order only breaks exact ties.
+    QString best, bestPartial;
+    int bestPartialCount = 0;
+    qint64 bestScore = std::numeric_limits<qint64>::max();
+    const QDate soon = QDate::currentDate().addDays(3);
     for (const QString &f : formats) {
         int ok = 0;
-        for (const auto &v : values)
-            if (parseDate(v, f).isValid()) ++ok;
-        if (ok > bestCount) {
-            best = f;
-            bestCount = ok;
+        QDate lo, hi;
+        int future = 0;
+        for (const auto &v : values) {
+            const QDate d = parseDate(v, f);
+            if (!d.isValid()) continue;
+            ++ok;
+            if (!lo.isValid() || d < lo) lo = d;
+            if (!hi.isValid() || d > hi) hi = d;
+            if (d > soon) ++future;
         }
-        if (ok == values.size()) return f;
+        if (ok == values.size()) {
+            const qint64 score = static_cast<qint64>(future) * 100000 + lo.daysTo(hi);
+            if (score < bestScore) {
+                bestScore = score;
+                best = f;
+            }
+        } else if (ok > bestPartialCount) {
+            bestPartial = f;
+            bestPartialCount = ok;
+        }
     }
-    return bestCount * 10 >= values.size() * 8 ? best : QString();
+    if (!best.isEmpty()) return best;
+    return bestPartialCount * 10 >= values.size() * 8 ? bestPartial : QString();
 }
 
 qint64 parseSignedAmount(const QString &text, bool *ok)
@@ -335,7 +362,8 @@ CsvMapping guessCsvMapping(const QList<QStringList> &rows, QChar delimiter)
         else if (m.amount < 0 && headerHas(h, {"amount", "value", "sum", "betrag", "importe", "montant"})) m.amount = c;
         else if (m.description < 0 && headerHas(h, {"description", "details", "narrative", "payee", "merchant", "name", "particulars", "transaction", "reference"}))
             m.description = c;
-        else if (m.memo < 0 && headerHas(h, {"memo", "note", "category"})) m.memo = c;
+        else if (m.reference < 0 && headerIs(h, {"reference", "referencenumber", "refno", "transactionid", "transactionreference", "fitid"})) m.reference = c;
+        else if (m.memo < 0 && headerHas(h, {"memo", "note", "extendeddetails"})) m.memo = c;
     }
     if (headerIs(header.value(m.amount), {"balance"})) m.amount = -1;
     if (m.amount >= 0 && (m.debit >= 0 || m.credit >= 0)) {
@@ -421,6 +449,11 @@ ParseResult parseCsv(const QByteArray &data, const CsvMapping *mapping)
         l.amount = amount;
         l.description = row.value(m.description).simplified();
         if (m.memo >= 0) l.memo = row.value(m.memo).simplified();
+        if (m.reference >= 0) {
+            QString ref = row.value(m.reference).trimmed();
+            ref.remove(QLatin1Char('\''));
+            if (!ref.isEmpty()) l.externalId = QStringLiteral("csv:") + ref;
+        }
         res.lines << l;
     }
     if (res.lines.isEmpty()) res.error = QStringLiteral("No transactions were found with the selected columns and date format.");
@@ -555,9 +588,10 @@ QString cleanDescription(const QString &raw)
 {
     QString s = raw.simplified();
     static const QRegularExpression prefixes(
-        QStringLiteral("^(POS|PURCHASE|CARD PURCHASE|DEBIT CARD PURCHASE|VISA PURCHASE|VISA DEBIT|DEBIT CARD|CHECKCARD|CHECK CARD|"
-                       "CONTACTLESS|DIRECT DEBIT|DD|ACH DEBIT|ACH CREDIT|ACH|ONLINE PAYMENT|PAYMENT TO|EFTPOS|EFT|RECURRING PAYMENT|"
-                       "PURCHASE AUTHORIZED ON \\d{1,2}/\\d{1,2})\\b[\\s:-]*"),
+        QStringLiteral("^(PURCHASE AUTHORIZED ON \\d{1,2}/\\d{1,2}|PURCHASE INTL AUTHORIZED ON \\d{1,2}/\\d{1,2}|"
+                       "RECURRING PAYMENT AUTHORIZED ON \\d{1,2}/\\d{1,2}|AUTHORIZED ON \\d{1,2}/\\d{1,2}|"
+                       "DEBIT CARD PURCHASE|CARD PURCHASE|VISA PURCHASE|VISA DEBIT|DEBIT CARD|CHECKCARD|CHECK CARD|PURCHASE|POS|"
+                       "CONTACTLESS|DIRECT DEBIT|DD|ACH DEBIT|ACH CREDIT|ACH|ONLINE PAYMENT|PAYMENT TO|EFTPOS|EFT|RECURRING PAYMENT)\\b[\\s:-]*"),
         QRegularExpression::CaseInsensitiveOption);
     static const QRegularExpression leadingNumber(QStringLiteral("^\\d{2,4}\\s+"));
     for (int i = 0; i < 3; ++i) {
@@ -568,6 +602,9 @@ QString cleanDescription(const QString &raw)
         "(\\b(X{2,}|\\*{2,})\\d{2,}\\b|\\bCARD\\s*\\d{2,}\\b|\\b\\d{5,}\\b|\\b\\d{1,2}/\\d{1,2}(/\\d{2,4})?\\b|\\b\\d{3}-\\d{3}-\\d{4}\\b|#\\s?\\d+)"),
         QRegularExpression::CaseInsensitiveOption);
     s.remove(noise);
+    static const QRegularExpression refs(QStringLiteral("\\b[A-Z]{1,2}\\d{8,}\\b|\\b\\d{1,2}:\\d{2}(:\\d{2})?\\s?(AM|PM)?\\b"),
+                                         QRegularExpression::CaseInsensitiveOption);
+    s.remove(refs); // bank reference codes and times
     static const QRegularExpression trailingCountry(QStringLiteral("\\s+[A-Z]{2}$"));
     if (s.size() > 8) s.remove(trailingCountry);
     s = s.simplified();
@@ -594,6 +631,21 @@ QString payeeKey(const QString &description)
     return words.mid(0, 2).join(QLatin1Char(' '));
 }
 
+bool looksLikeTransfer(const QString &description)
+{
+    // Card-side: "AUTOPAY PAYMENT - THANK YOU". Bank-side: payments to a card issuer, or transfers
+    // between your own accounts. (Kept narrow so ordinary bills paid by ACH aren't caught.)
+    static const QRegularExpression re(QStringLiteral(
+        "(payment\\s*-?\\s*thank\\s*you|autopay\\s*payment|(mobile|online|internet)\\s*payment\\s*-?\\s*thank|"
+        "(american\\s*express|amex|chase|citi\\s*card|citibank|capital\\s*one|discover|barclaycard|synchrony|"
+        "wells\\s*fargo\\s*card|wf\\s*credit\\s*card|u\\.?s\\.?\\s*bank\\s*card|usbank\\s*card)\\s*"
+        "(ach\\s*pmt|e-?payment|epay|payment|pmt|crd\\s*pmt|autopay|online\\s*pmt)|"
+        "(credit\\s*)?card\\s*payment|payment\\s*to\\s*(credit\\s*)?card|"
+        "online\\s*transfer\\s*(to|from)|transfer\\s*(to|from)\\s*(sav|chk|checking|savings|acct|account)|internal\\s*transfer)"),
+        QRegularExpression::CaseInsensitiveOption);
+    return re.match(description).hasMatch();
+}
+
 Suggestion suggestCategory(const Store &store, const QString &description, TxType type)
 {
     Suggestion sg;
@@ -615,6 +667,8 @@ Suggestion suggestCategory(const Store &store, const QString &description, TxTyp
             return sg;
         }
     }
+    // 1b. Card payments and transfers between your own accounts would be counted twice
+    if (looksLikeTransfer(description)) sg.transfer = true;
     // 2. What you chose for this payee before (newest first)
     const QString key = payeeKey(description);
     if (!key.isEmpty()) {
@@ -654,12 +708,26 @@ Suggestion suggestCategory(const Store &store, const QString &description, TxTyp
     return sg;
 }
 
-QVector<Proposed> prepare(const Store &store, const Account &account, const QVector<StatementLine> &lines)
+bool flipApplies(const Account &account, const QString &format)
+{
+    return account.flipSigns && format != QLatin1String("OFX");
+}
+
+bool chargesLookPositive(const Account &account, const QVector<StatementLine> &lines)
+{
+    if (!account.isCard() || lines.size() < 3) return false;
+    int positive = 0;
+    for (const auto &l : lines)
+        if (l.amount > 0) ++positive;
+    return positive * 10 >= static_cast<int>(lines.size()) * 7; // 70%+ "income" on a card is almost certainly charges
+}
+
+QVector<Proposed> prepare(const Store &store, const Account &account, const QVector<StatementLine> &lines, bool flipSigns)
 {
     QVector<Proposed> out;
     QSet<QString> claimed; // existing transactions already matched as possible duplicates
     for (StatementLine l : lines) {
-        if (account.flipSigns) l.amount = -l.amount;
+        if (flipSigns) l.amount = -l.amount;
         Proposed p;
         p.line = l;
         const TxType type = l.amount >= 0 ? TxType::Income : TxType::Expense;
@@ -683,6 +751,10 @@ QVector<Proposed> prepare(const Store &store, const Account &account, const QVec
         } else if (sg.ignore) {
             p.status = Proposed::Status::Ignored;
             p.note = QStringLiteral("Ignored by a rule (e.g. transfer or card payment)");
+            p.include = false;
+        } else if (sg.transfer) {
+            p.status = Proposed::Status::Ignored;
+            p.note = QStringLiteral("Looks like a card payment or transfer between your accounts — not imported so it isn't counted twice");
             p.include = false;
         } else {
             // Same amount and type within 3 days: probably entered by hand or by a recurring rule
@@ -749,7 +821,8 @@ QVector<AutoImportResult> runAutoImport(Store &store)
                 QFile::rename(path, QDir(dir).filePath(QStringLiteral("Could not import/") + name));
                 continue;
             }
-            const auto items = prepare(store, acc, pr.lines);
+            const bool flip = flipApplies(acc, pr.format) || (!acc.flipSigns && pr.format != QLatin1String("OFX") && chargesLookPositive(acc, pr.lines));
+            const auto items = prepare(store, acc, pr.lines, flip);
             QString err;
             r.imported = commit(store, items, &err);
             if (r.imported < 0) {

@@ -2,6 +2,7 @@
 
 #include "Widgets.h"
 #include "core/BankImport.h"
+#include "core/Institutions.h"
 #include "core/Store.h"
 
 #include <QCheckBox>
@@ -48,6 +49,16 @@ AccountDialog::AccountDialog(QWidget *parent)
     setMinimumWidth(520);
     auto *l = new QVBoxLayout(this);
     l->setSpacing(8);
+    l->addWidget(new QLabel(QStringLiteral("<b>Bank or card issuer</b>")));
+    m_preset = new QComboBox;
+    m_preset->setObjectName(QStringLiteral("institutionCombo"));
+    m_preset->addItem(QStringLiteral("Other bank or card…"), QString());
+    for (const auto &i : institutions::all()) m_preset->addItem(i.label, i.key);
+    l->addWidget(m_preset);
+    m_help = ui::muted(QString());
+    m_help->hide();
+    l->addWidget(m_help);
+    l->addSpacing(4);
     m_kind = new SegmentedControl({{QStringLiteral("bank"), QStringLiteral("  Bank account  ")}, {QStringLiteral("card"), QStringLiteral("  Credit card  ")}});
     l->addWidget(m_kind, 0, Qt::AlignLeft);
     l->addWidget(new QLabel(QStringLiteral("<b>Name</b>")));
@@ -57,10 +68,11 @@ AccountDialog::AccountDialog(QWidget *parent)
     m_name->setPlaceholderText(QStringLiteral("e.g. Business Checking, Amex Gold ••1004"));
     l->addWidget(m_name);
     l->addWidget(ui::muted(QStringLiteral("Shown as the payment method on imported transactions.")));
-    m_flip = new QCheckBox(QStringLiteral("Statements show money going out as positive numbers"));
+    m_flip = new QCheckBox(QStringLiteral("CSV statements show money going out as positive numbers"));
     l->addSpacing(4);
     l->addWidget(m_flip);
-    l->addWidget(ui::muted(QStringLiteral("Some credit-card CSV files list charges as positive amounts. Tick this if imported purchases show up as income.")));
+    l->addWidget(ui::muted(QStringLiteral("Some credit-card CSV files (e.g. American Express) list charges as positive amounts. Ledgerly usually "
+                                          "notices this by itself; tick it if imported purchases show up as income. OFX/QFX/QBO files are not affected.")));
 
     l->addSpacing(6);
     l->addWidget(new QLabel(QStringLiteral("<b>Automatic import folder</b> (optional)")));
@@ -89,6 +101,18 @@ AccountDialog::AccountDialog(QWidget *parent)
         if (!d.isEmpty()) m_folder->setText(QDir::toNativeSeparators(d));
     });
     connect(clear, &QPushButton::clicked, m_folder, &QLineEdit::clear);
+    connect(m_preset, &QComboBox::currentIndexChanged, this, [this]() {
+        const institutions::Institution *inst = institutions::find(m_preset->currentData().toString());
+        m_help->setVisible(inst != nullptr);
+        if (!inst) return;
+        m_help->setText(QStringLiteral("How to download statements: ") + inst->downloadSteps);
+        bool fromPreset = m_name->text().isEmpty();
+        for (const auto &i : institutions::all())
+            if (m_name->text() == i.accountName) fromPreset = true;
+        if (fromPreset) m_name->setText(inst->accountName);
+        m_kind->setValue(inst->kind);
+        m_flip->setChecked(inst->csvChargesPositive);
+    });
 }
 
 void AccountDialog::setAccount(const Account &a)

@@ -29,6 +29,7 @@ struct CsvMapping {
     int debit = -1;      // ...separate money-out / money-in columns
     int credit = -1;
     int memo = -1;
+    int reference = -1;  // bank's own transaction reference (used to skip duplicates)
     QString dateFormat;  // Qt date format, e.g. "dd/MM/yyyy"
     bool isValid() const { return date >= 0 && description >= 0 && (amount >= 0 || debit >= 0 || credit >= 0) && !dateFormat.isEmpty(); }
     QString toJson() const;
@@ -70,7 +71,10 @@ struct Suggestion {
     QString categoryId;
     QString source; // "rule", "history", "keyword", "default"
     bool ignore = false;
+    bool transfer = false; // looks like a card payment / transfer between own accounts
 };
+// True for lines like "AUTOPAY PAYMENT - THANK YOU" or "AMERICAN EXPRESS ACH PMT".
+bool looksLikeTransfer(const QString &description);
 Suggestion suggestCategory(const Store &store, const QString &description, TxType type);
 
 struct Proposed {
@@ -82,8 +86,14 @@ struct Proposed {
     bool include = true; // default selection in the review list
 };
 
-// Turns statement lines into transactions for an account. flipSigns: money out appears positive.
-QVector<Proposed> prepare(const Store &store, const Account &account, const QVector<StatementLine> &lines);
+// Turns statement lines into transactions for an account. flipSigns: the file shows money
+// going out as positive numbers (e.g. American Express CSV) - swap income and expenses.
+QVector<Proposed> prepare(const Store &store, const Account &account, const QVector<StatementLine> &lines, bool flipSigns = false);
+// Whether the account's "swap signs" setting applies to this file format (CSV/QIF only;
+// OFX/QFX/QBO and live connections always use the standard sign convention).
+bool flipApplies(const Account &account, const QString &format);
+// Card statement where most amounts are positive -> charges are probably shown as positive.
+bool chargesLookPositive(const Account &account, const QVector<StatementLine> &lines);
 int commit(Store &store, const QVector<Proposed> &items, QString *error); // imports included items
 
 struct AutoImportResult {

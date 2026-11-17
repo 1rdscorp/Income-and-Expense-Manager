@@ -289,15 +289,26 @@ void ImportDialog::reparse(bool fromUi)
     if (!m_parse.accountHint.isEmpty()) info += QStringLiteral(" · account %1").arg(m_parse.accountHint.right(8).toHtmlEscaped());
     if (m_parse.looksLikeCard && !acc.isCard() && !acc.id.isEmpty()) info += QStringLiteral(" · <i>this looks like a credit-card statement</i>");
     if (acc.id.isEmpty()) info += ui::colorSpan(QStringLiteral(" — choose or create the account it belongs to"), Theme::c().badText, true);
+    // Card statements that list charges as positive numbers (e.g. American Express CSV)
+    if (m_parse.format != QLatin1String("OFX") && !m_flip->isChecked() && bank::chargesLookPositive(acc, m_parse.lines)) {
+        m_updating = true;
+        m_flip->setChecked(true);
+        m_updating = false;
+        info += QStringLiteral("<br>Charges are listed as positive numbers in this card statement, so income and expenses were swapped "
+                               "(untick below if that's wrong).");
+    }
     m_info->setText(info);
     prepareItems();
 }
 
 void ImportDialog::prepareItems()
 {
-    Account acc = currentAccount();
-    acc.flipSigns = m_flip->isChecked();
-    m_items = m_parse.ok() ? bank::prepare(Store::instance(), acc, m_parse.lines) : QVector<bank::Proposed>();
+    const Account acc = currentAccount();
+    const bool isOfx = m_parse.format == QLatin1String("OFX");
+    m_flip->setEnabled(!isOfx);
+    m_flip->setToolTip(isOfx ? QStringLiteral("OFX/QFX/QBO files always use the standard sign convention") : QString());
+    const bool flip = !isOfx && m_flip->isChecked();
+    m_items = m_parse.ok() ? bank::prepare(Store::instance(), acc, m_parse.lines, flip) : QVector<bank::Proposed>();
     rebuildTable();
 }
 
