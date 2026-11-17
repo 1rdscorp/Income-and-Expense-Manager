@@ -17,9 +17,11 @@ public:
 
 public slots:
     void refresh();
+    void exportExcel();
 
 private:
     void exportCsv();
+    QString baseFileName() const;
     void exportPdf();
     void print();
     void buildDocument(QTextDocument *doc);

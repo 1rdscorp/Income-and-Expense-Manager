@@ -127,4 +127,6 @@ QLabel *muted(const QString &text, QWidget *parent = nullptr);
 void clearLayout(QLayout *layout);
 void fitTableHeight(QTableWidget *table);
 QString colorSpan(const QString &text, const QColor &color, bool bold = false);
+// Save dialog offering Excel (.xlsx, default) or CSV. Returns the chosen path (with extension) or empty.
+QString askExportPath(QWidget *parent, const QString &title, const QString &baseName, bool excelDefault = true);
 } // namespace ui

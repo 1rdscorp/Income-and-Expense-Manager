@@ -20,5 +20,9 @@ bool writeAutoBackup(Store &store, const QString &dir, int keep, QString *error,
 
 QString defaultFileName(const Store &store, bool includeReceipts);
 QString transactionsCsv(const Store &store, const QVector<Transaction> &list);
+// Excel workbook with one filterable "Transactions" sheet (dates and amounts as real values).
+QByteArray transactionsXlsx(const Store &store, const QVector<Transaction> &list, const QString &title = QString());
+// Writes CSV or Excel depending on the file extension (.xlsx / .csv).
+bool exportTransactions(const Store &store, const QVector<Transaction> &list, const QString &path, const QString &title, QString *error);
 
 } // namespace backup

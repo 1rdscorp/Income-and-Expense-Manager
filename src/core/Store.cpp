@@ -973,6 +973,58 @@ bool Store::saveRecurring(const Recurring &input, QString *error, const QDate &t
     return true;
 }
 
+bool Store::makeRecurring(const QString &txId, Frequency frequency, bool recordMissed, QString *error, const QDate &today, QString *ruleId)
+{
+    const Transaction *tp = transaction(txId);
+    if (!tp) {
+        if (error) *error = QStringLiteral("Transaction not found.");
+        return false;
+    }
+    if (!tp->recurringId.isEmpty() && recurringRule(tp->recurringId)) {
+        if (error) *error = QStringLiteral("This transaction is already part of a recurring series.");
+        return false;
+    }
+    Transaction t = *tp;
+    Recurring r;
+    r.id = util::newId();
+    r.type = t.type;
+    r.categoryId = t.categoryId;
+    r.amount = t.amount;
+    r.description = t.description;
+    if (r.description.isEmpty() && t.vendor.isEmpty()) r.description = categoryOrUnknown(t.categoryId).name;
+    r.vendor = t.vendor;
+    r.paymentMethod = t.paymentMethod;
+    r.notes = t.notes;
+    r.frequency = frequency;
+    r.startDate = t.date;
+    r.day = t.date.day();
+    r.nextDate = recurrence::advance(t.date, frequency, r.day);
+    if (!recordMissed) {
+        int guard = 0;
+        while (r.nextDate <= today && guard++ < 5000) r.nextDate = recurrence::advance(r.nextDate, frequency, r.day);
+    }
+
+    // Link the transaction as the series' first payment
+    t.recurringId = r.id;
+    t.updatedAt = util::nowIso();
+    if (!writeTransaction(t)) {
+        if (error) *error = m_db.lastError().text();
+        return false;
+    }
+    for (auto &x : m_transactions)
+        if (x.id == t.id) x = t;
+    if (!saveRecurring(r, error, today)) {
+        // roll back the link
+        t.recurringId.clear();
+        writeTransaction(t);
+        for (auto &x : m_transactions)
+            if (x.id == t.id) x = t;
+        return false;
+    }
+    if (ruleId) *ruleId = r.id;
+    return true;
+}
+
 bool Store::setRecurringActive(const QString &id, bool active, const QDate &today)
 {
     const Recurring *old = recurringRule(id);

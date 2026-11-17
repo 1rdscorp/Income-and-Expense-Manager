@@ -14,6 +14,7 @@ QString nowIso();
 void setCurrency(const QString &code);
 QString currencyCode();
 QString currencySymbol();
+int currencyDecimals();
 QString money(qint64 cents);
 QString signedMoney(qint64 cents);   // "−$12.00" for negatives
 QString moneyCompact(qint64 cents);  // "$12.5K"

@@ -228,9 +228,55 @@ private slots:
         edit.setTransaction(posted);
         bool noted = false;
         for (auto *l : edit.findChildren<QLabel *>())
-            if (l->text().contains(QStringLiteral("Recorded automatically"))) noted = !l->isHidden();
+            if (l->text().contains(QStringLiteral("Part of the recurring"))) noted = !l->parentWidget()->isHidden();
         QVERIFY(noted);
         QVERIFY(edit.findChild<QCheckBox *>(QStringLiteral("repeatCheck"))->parentWidget()->isHidden());
+
+        // "Stop repeating" from the edit dialog removes the series but keeps the payments
+        const int postedCount = s.recurringPostedCount(rule->id);
+        const QString ruleId = rule->id;
+        const int txCount = s.transactions().size();
+        acceptNextMessageBox();
+        buttonByAccessibleName(&edit, QStringLiteral("stopRepeating"))->click();
+        QVERIFY(!s.recurringRule(ruleId));
+        QCOMPARE(s.transactions().size(), txCount);
+        QVERIFY(postedCount >= 3);
+        QVERIFY(!edit.findChild<QCheckBox *>(QStringLiteral("repeatCheck"))->parentWidget()->isHidden()); // can repeat again
+    }
+
+    void makeExistingTransactionRecurring()
+    {
+        Store &s = Store::instance();
+        // An existing expense from two months ago, not recurring yet
+        Transaction t;
+        t.categoryId = categoryId(QStringLiteral("Insurance"));
+        t.amount = 21500;
+        t.date = QDate::currentDate().addMonths(-2);
+        t.description = QStringLiteral("Liability insurance");
+        QString err;
+        QVERIFY(s.saveTransaction(t, {}, {}, &err));
+        QString id;
+        for (const auto &x : s.transactions())
+            if (x.description == QLatin1String("Liability insurance")) id = x.id;
+        const int before = s.transactions().size();
+
+        TransactionDialog dlg;
+        dlg.setTransaction(*s.transaction(id));
+        dlg.setRepeatChecked(true);
+        auto *missed = dlg.findChild<QCheckBox *>(QStringLiteral("recordMissed"));
+        QVERIFY(!missed->isHidden());       // offers the 2 payments since then
+        QVERIFY(!missed->isChecked());      // but doesn't record them by default for existing ones
+        QVERIFY(missed->text().contains(QStringLiteral("2 payments")));
+        buttonByAccessibleName(&dlg, QStringLiteral("save"))->click();
+
+        const Transaction *tx = s.transaction(id);
+        QVERIFY(tx && !tx->recurringId.isEmpty());
+        const Recurring *rule = s.recurringRule(tx->recurringId);
+        QVERIFY(rule);
+        QCOMPARE(rule->startDate, t.date);
+        QVERIFY(rule->nextDate > QDate::currentDate());
+        QCOMPARE(s.transactions().size(), before); // nothing back-filled
+        QCOMPARE(s.recurringPostedCount(rule->id), 1);
     }
 
     void recurringDialogFutureStart()

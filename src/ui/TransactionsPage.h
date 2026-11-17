@@ -34,6 +34,7 @@ private:
     void deleteSelected();
     QStringList selectedIds() const;
     void showContextMenu(const QPoint &pos);
+    void stopRepeating(const QString &ruleId);
 
     SegmentedControl *m_mode;
     PeriodNav *m_period;

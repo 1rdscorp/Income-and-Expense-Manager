@@ -1,6 +1,7 @@
 #include "TransactionDialog.h"
 
 #include "ReceiptViewer.h"
+#include "RecurringDialog.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "core/Defaults.h"
@@ -152,10 +153,12 @@ TransactionDialog::TransactionDialog(QWidget *parent)
     g->setColumnStretch(1, 1);
     root->addLayout(g);
 
-    // Repeat (new transactions) / series notice (recorded by a recurring rule)
+    // Repeat: makes this transaction the first payment of a recurring series
     m_repeatRow = new QWidget;
-    auto *rr = new QHBoxLayout(m_repeatRow);
-    rr->setContentsMargins(0, 0, 0, 0);
+    auto *rv = new QVBoxLayout(m_repeatRow);
+    rv->setContentsMargins(0, 0, 0, 0);
+    rv->setSpacing(4);
+    auto *rr = new QHBoxLayout;
     m_repeat = new QCheckBox(QStringLiteral("Repeat this transaction"));
     m_repeat->setObjectName(QStringLiteral("repeatCheck"));
     m_repeat->setIcon(Theme::icon(QStringLiteral("repeat"), Theme::c().accent));
@@ -168,28 +171,46 @@ TransactionDialog::TransactionDialog(QWidget *parent)
     rr->addWidget(m_repeat);
     rr->addWidget(m_repeatFreq);
     rr->addWidget(m_repeatHint, 1);
+    rv->addLayout(rr);
+    m_recordMissed = new QCheckBox;
+    m_recordMissed->setObjectName(QStringLiteral("recordMissed"));
+    m_recordMissed->hide();
+    rv->addWidget(m_recordMissed);
     root->addWidget(m_repeatRow);
-    m_seriesNote = ui::muted(QString());
+
+    // Series: shown when the transaction already belongs to a recurring rule
+    m_seriesRow = new QFrame;
+    m_seriesRow->setObjectName(QStringLiteral("infoBanner"));
+    auto *sr = new QHBoxLayout(m_seriesRow);
+    sr->setContentsMargins(12, 8, 12, 8);
+    auto *seriesIcon = new QLabel;
+    seriesIcon->setPixmap(Theme::iconPixmap(QStringLiteral("repeat"), Theme::c().accent, 18));
+    m_seriesNote = new QLabel;
+    m_seriesNote->setWordWrap(true);
     m_seriesNote->setTextFormat(Qt::RichText);
-    m_seriesNote->hide();
-    root->addWidget(m_seriesNote);
-    auto syncRepeat = [this]() {
-        m_repeatFreq->setEnabled(m_repeat->isChecked());
-        if (!m_repeat->isChecked()) {
-            m_repeatHint->setText(QStringLiteral("e.g. rent, internet, subscriptions"));
-            return;
-        }
-        Recurring r;
-        r.frequency = frequencyFromString(m_repeatFreq->currentData().toString());
-        r.startDate = m_date->date();
-        r.day = r.startDate.day();
-        const QDate next = recurrence::advance(r.startDate, r.frequency, r.day);
-        m_repeatHint->setText(QStringLiteral("%1 — next on %2, recorded automatically").arg(recurrence::describe(r), util::fmtDate(next)));
-    };
-    connect(m_repeat, &QCheckBox::toggled, this, syncRepeat);
-    connect(m_repeatFreq, &QComboBox::currentIndexChanged, this, syncRepeat);
-    connect(m_date, &QDateEdit::dateChanged, this, syncRepeat);
-    syncRepeat();
+    auto *editSeries = ui::button(QStringLiteral("Edit series…"), QStringLiteral("edit"));
+    auto *stopSeries = ui::button(QStringLiteral("Stop repeating"), QStringLiteral("x"), QStringLiteral("dangerText"));
+    stopSeries->setAccessibleName(QStringLiteral("stopRepeating"));
+    sr->addWidget(seriesIcon, 0, Qt::AlignTop);
+    sr->addWidget(m_seriesNote, 1);
+    sr->addWidget(editSeries);
+    sr->addWidget(stopSeries);
+    m_seriesRow->hide();
+    root->addWidget(m_seriesRow);
+
+    connect(m_repeat, &QCheckBox::toggled, this, &TransactionDialog::syncRepeat);
+    connect(m_repeatFreq, &QComboBox::currentIndexChanged, this, &TransactionDialog::syncRepeat);
+    connect(m_date, &QDateEdit::dateChanged, this, &TransactionDialog::syncRepeat);
+    connect(m_recordMissed, &QCheckBox::toggled, this, &TransactionDialog::syncRepeat);
+    connect(editSeries, &QPushButton::clicked, this, [this]() {
+        const Recurring *rule = Store::instance().recurringRule(m_tx.recurringId);
+        if (!rule) return;
+        RecurringDialog dlg(this);
+        dlg.setRule(*rule);
+        dlg.exec();
+        syncSeries();
+    });
+    connect(stopSeries, &QPushButton::clicked, this, &TransactionDialog::stopRepeating);
 
     // Receipts
     auto *rc = new QFrame;
@@ -288,9 +309,9 @@ void TransactionDialog::setNewType(TxType type)
     m_type = type;
     m_deleteBtn->hide();
     m_anotherBtn->show();
-    m_repeatRow->show();
     m_repeat->setChecked(false);
-    m_seriesNote->hide();
+    m_recordMissed->setChecked(true); // a new transaction dated in the past: record what came after it
+    syncSeries();
     m_receipts.clear();
     m_removed.clear();
     loadFields(m_tx);
@@ -307,15 +328,9 @@ void TransactionDialog::setTransaction(const Transaction &t)
     m_typeSeg->setValue(typeToString(t.type));
     m_deleteBtn->show();
     m_anotherBtn->hide();
-    m_repeatRow->hide();
-    if (const Recurring *rule = Store::instance().recurringRule(t.recurringId)) {
-        m_seriesNote->setText(QStringLiteral("🔁 Recorded automatically by the recurring “%1” (%2). Changes here apply to this payment only — "
-                                             "edit the series on the <b>Recurring</b> page.")
-                                  .arg(rule->title().toHtmlEscaped(), recurrence::describe(*rule).toLower().toHtmlEscaped()));
-        m_seriesNote->show();
-    } else {
-        m_seriesNote->hide();
-    }
+    m_repeat->setChecked(false);
+    m_recordMissed->setChecked(false); // existing payments may already be recorded by hand
+    syncSeries();
     m_saveBtn->setText(QStringLiteral("Save changes"));
     m_receipts.clear();
     m_removed.clear();
@@ -492,30 +507,15 @@ void TransactionDialog::save(bool another)
     for (const auto &p : m_receipts)
         if (p.isNew) fresh << p.r;
     QString err;
-    Recurring rule;
-    const bool repeat = !m_editing && m_repeat->isChecked();
-    if (repeat) {
-        // This transaction is the first payment of the new series.
-        rule.id = util::newId();
-        t.recurringId = rule.id;
-    }
+    const bool repeat = m_repeat->isChecked() && !Store::instance().recurringRule(m_tx.recurringId);
+    if (t.id.isEmpty()) t.id = util::newId();
     if (!Store::instance().saveTransaction(t, fresh, m_removed, &err)) {
         QMessageBox::warning(this, windowTitle(), err);
         return;
     }
     if (repeat) {
-        rule.type = t.type;
-        rule.categoryId = t.categoryId;
-        rule.amount = t.amount;
-        rule.description = t.description.isEmpty() ? (t.vendor.isEmpty() ? m_category->currentText().section(QStringLiteral("   "), -1) : QString()) : t.description;
-        rule.vendor = t.vendor;
-        rule.paymentMethod = t.paymentMethod;
-        rule.notes = t.notes;
-        rule.frequency = frequencyFromString(m_repeatFreq->currentData().toString());
-        rule.startDate = t.date;
-        rule.day = t.date.day();
-        rule.nextDate = recurrence::advance(t.date, rule.frequency, rule.day);
-        if (!Store::instance().saveRecurring(rule, &err))
+        // This transaction becomes the first payment of a new recurring series.
+        if (!Store::instance().makeRecurring(t.id, frequencyFromString(m_repeatFreq->currentData().toString()), m_recordMissed->isChecked(), &err))
             QMessageBox::warning(this, windowTitle(), QStringLiteral("The transaction was saved, but the repeat could not be set up: %1").arg(err));
     }
     g_lastType = t.type;
@@ -523,6 +523,95 @@ void TransactionDialog::save(bool another)
     m_type = t.type;
     m_outcome = another ? SavedAddAnother : Saved;
     accept();
+}
+
+QVector<QDate> TransactionDialog::missedDates() const
+{
+    Recurring r;
+    r.frequency = frequencyFromString(m_repeatFreq->currentData().toString());
+    r.startDate = m_date->date();
+    r.day = r.startDate.day();
+    QVector<QDate> out;
+    const QDate today = QDate::currentDate();
+    QDate d = recurrence::advance(r.startDate, r.frequency, r.day);
+    while (d.isValid() && d <= today && out.size() < 1000) {
+        out << d;
+        d = recurrence::advance(d, r.frequency, r.day);
+    }
+    return out;
+}
+
+void TransactionDialog::syncRepeat()
+{
+    const bool on = m_repeat->isChecked();
+    m_repeatFreq->setEnabled(on);
+    if (!on) {
+        m_repeatHint->setText(m_editing ? QStringLiteral("make this a regular bill or income, e.g. rent or internet")
+                                        : QStringLiteral("e.g. rent, internet, subscriptions"));
+        m_recordMissed->hide();
+        return;
+    }
+    Recurring r;
+    r.frequency = frequencyFromString(m_repeatFreq->currentData().toString());
+    r.startDate = m_date->date();
+    r.day = r.startDate.day();
+    const QVector<QDate> missed = missedDates();
+    QDate next = missed.isEmpty() ? recurrence::advance(r.startDate, r.frequency, r.day) : recurrence::advance(missed.last(), r.frequency, r.day);
+    m_repeatHint->setText(QStringLiteral("%1 — next on %2, recorded automatically").arg(recurrence::describe(r), util::fmtDate(next)));
+    if (missed.isEmpty()) {
+        m_recordMissed->hide();
+    } else {
+        QStringList dates;
+        for (int i = 0; i < std::min<int>(3, missed.size()); ++i) dates << util::fmtDate(missed[i]);
+        if (missed.size() > 3) dates << QStringLiteral("…");
+        m_recordMissed->setText(QStringLiteral("Also record the %1 payment%2 since then (%3)")
+                                    .arg(missed.size())
+                                    .arg(missed.size() == 1 ? QString() : QStringLiteral("s"), dates.join(QStringLiteral(", "))));
+        m_recordMissed->show();
+    }
+}
+
+void TransactionDialog::syncSeries()
+{
+    const Recurring *rule = Store::instance().recurringRule(m_tx.recurringId);
+    if (rule) {
+        const int n = Store::instance().recurringPostedCount(rule->id);
+        m_seriesNote->setText(QStringLiteral("<b>Part of the recurring “%1”</b> — %2, %3 payment%4 recorded%5.<br>Changes here apply to this payment only.")
+                                  .arg(rule->title().toHtmlEscaped(), recurrence::describe(*rule).toLower().toHtmlEscaped())
+                                  .arg(n)
+                                  .arg(n == 1 ? QString() : QStringLiteral("s"),
+                                       rule->active && !rule->finished() ? QStringLiteral(", next on %1").arg(util::fmtDate(rule->nextDate))
+                                                                         : (rule->active ? QStringLiteral(", ended") : QStringLiteral(", paused"))));
+    }
+    m_seriesRow->setVisible(rule != nullptr);
+    m_repeatRow->setVisible(rule == nullptr);
+    syncRepeat();
+}
+
+void TransactionDialog::setRepeatChecked(bool on)
+{
+    if (!Store::instance().recurringRule(m_tx.recurringId)) m_repeat->setChecked(on);
+}
+
+void TransactionDialog::stopRepeating()
+{
+    const Recurring *rule = Store::instance().recurringRule(m_tx.recurringId);
+    if (!rule) return;
+    const int n = Store::instance().recurringPostedCount(rule->id);
+    if (QMessageBox::question(this, QStringLiteral("Stop repeating"),
+                              QStringLiteral("Stop the recurring “%1”?\n\nNo more payments will be recorded automatically. "
+                                             "The %2 payment(s) already recorded, including this one, are kept.")
+                                  .arg(rule->title())
+                                  .arg(n))
+        != QMessageBox::Yes)
+        return;
+    QString err;
+    if (!Store::instance().deleteRecurring(rule->id, &err)) {
+        QMessageBox::warning(this, windowTitle(), err);
+        return;
+    }
+    m_tx.recurringId.clear();
+    syncSeries();
 }
 
 void TransactionDialog::remove()

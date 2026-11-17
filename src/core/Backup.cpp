@@ -2,6 +2,7 @@
 #include "Defaults.h"
 #include "Store.h"
 #include "Util.h"
+#include "Xlsx.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -309,6 +310,69 @@ QString transactionsCsv(const Store &store, const QVector<Transaction> &list)
                             QString::number(store.receiptCount(t.id)), t.notes};
     }
     return util::toCsv(rows);
+}
+
+QByteArray transactionsXlsx(const Store &store, const QVector<Transaction> &list, const QString &title)
+{
+    xlsx::Workbook wb(util::currencySymbol().trimmed(), util::currencyDecimals());
+    xlsx::Sheet &sh = wb.addSheet(QStringLiteral("Transactions"));
+    xlsx::Cell t = xlsx::Cell::str(QStringLiteral("%1 — %2").arg(store.settings().businessName, title.isEmpty() ? QStringLiteral("Transactions") : title));
+    t.title = true;
+    sh.addRow({t});
+    QVector<Transaction> sorted = list;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Transaction &a, const Transaction &b) { return a.date < b.date; });
+    Totals tot = Store::totals(sorted);
+    xlsx::Cell sub = xlsx::Cell::str(QStringLiteral("%1 transactions · income %2 · expenses %3 · net %4")
+                                         .arg(tot.count)
+                                         .arg(util::money(tot.income), util::money(tot.expense), util::signedMoney(tot.net())));
+    sub.muted = true;
+    sh.addRow({sub});
+    const QStringList heads = {QStringLiteral("Date"), QStringLiteral("Type"), QStringLiteral("Category"), QStringLiteral("Description"),
+                               QStringLiteral("Vendor / Payee"), QStringLiteral("Payment method"), QStringLiteral("Amount"),
+                               QStringLiteral("Signed amount"), QStringLiteral("Receipts"), QStringLiteral("Recurring"), QStringLiteral("Notes")};
+    QVector<xlsx::Cell> head;
+    for (const auto &h : heads) {
+        xlsx::Cell c = xlsx::Cell::str(h);
+        c.bold = true;
+        c.fill = xlsx::Fill::Header;
+        if (h == QLatin1String("Amount") || h == QLatin1String("Signed amount") || h == QLatin1String("Receipts")) c.align = xlsx::Align::Right;
+        head << c;
+    }
+    sh.addRow(head);
+    sh.frozenRows = 3;
+    sh.autoFilterRow = 2;
+    for (const auto &x : sorted) {
+        sh.addRow({xlsx::Cell::day(x.date), xlsx::Cell::str(typeLabel(x.type)), xlsx::Cell::str(store.categoryOrUnknown(x.categoryId).name),
+                   xlsx::Cell::str(x.description), xlsx::Cell::str(x.vendor), xlsx::Cell::str(x.paymentMethod), xlsx::Cell::money(x.amount),
+                   xlsx::Cell::money(x.signedAmount()), xlsx::Cell::num(store.receiptCount(x.id), xlsx::Format::Integer),
+                   xlsx::Cell::str(x.recurringId.isEmpty() ? QString() : QStringLiteral("Yes")), xlsx::Cell::str(x.notes)});
+    }
+    sh.autoFilterLastRow = sh.rows.size() - 1;
+    QVector<xlsx::Cell> total{xlsx::Cell::str(QStringLiteral("Total")), xlsx::Cell(), xlsx::Cell(), xlsx::Cell(), xlsx::Cell(), xlsx::Cell(),
+                              xlsx::Cell(), xlsx::Cell::money(tot.net())};
+    for (auto &c : total) {
+        c.bold = true;
+        c.fill = xlsx::Fill::Total;
+    }
+    sh.addRow(total);
+    sh.columnWidths = {13, 10, 26, 30, 22, 16, 14, 15, 10, 10, 40};
+    return wb.toBytes();
+}
+
+bool exportTransactions(const Store &store, const QVector<Transaction> &list, const QString &path, const QString &title, QString *error)
+{
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) {
+        if (error) *error = f.errorString();
+        return false;
+    }
+    if (path.endsWith(QLatin1String(".xlsx"), Qt::CaseInsensitive)) f.write(transactionsXlsx(store, list, title));
+    else f.write(transactionsCsv(store, list).toUtf8());
+    if (!f.commit()) {
+        if (error) *error = f.errorString();
+        return false;
+    }
+    return true;
 }
 
 } // namespace backup

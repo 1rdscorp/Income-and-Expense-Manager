@@ -4,6 +4,7 @@
 #include "core/Reports.h"
 #include "core/Store.h"
 #include "core/Util.h"
+#include "core/Xlsx.h"
 
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -360,6 +361,73 @@ private slots:
         QCOMPARE(store().transactions().size(), 2);
         // reopen the main test database
         QVERIFY(store().open(mainDir, &err));
+    }
+
+
+    void makeRecurringFromExisting()
+    {
+        Store &s = store();
+        QString err;
+        Transaction t;
+        t.categoryId = catId(QStringLiteral("Software & Subscriptions"));
+        t.amount = 4900;
+        t.date = QDate(2026, 8, 3);
+        t.description = QStringLiteral("Accounting app");
+        QVERIFY(s.saveTransaction(t, {}, {}, &err));
+        QString id;
+        for (const auto &x : s.transactions())
+            if (x.description == QLatin1String("Accounting app")) id = x.id;
+
+        // Without back-filling: next payment is the first one after "today"
+        QString ruleId;
+        QVERIFY2(s.makeRecurring(id, Frequency::Monthly, false, &err, QDate(2026, 11, 17), &ruleId), qPrintable(err));
+        QCOMPARE(s.transaction(id)->recurringId, ruleId);
+        QCOMPARE(s.recurringRule(ruleId)->nextDate, QDate(2026, 12, 3));
+        QCOMPARE(s.recurringPostedCount(ruleId), 1);
+        QVERIFY(!s.makeRecurring(id, Frequency::Monthly, false, &err)); // already recurring
+
+        // Stop, then make it recurring again recording the missed months (Sep, Oct, Nov)
+        QVERIFY(s.deleteRecurring(ruleId, &err));
+        QVERIFY(s.transaction(id)->recurringId.isEmpty());
+        QVERIFY(s.makeRecurring(id, Frequency::Monthly, true, &err, QDate(2026, 11, 17), &ruleId));
+        QCOMPARE(s.recurringPostedCount(ruleId), 4);
+        QCOMPARE(s.recurringRule(ruleId)->nextDate, QDate(2026, 12, 3));
+        QVERIFY(s.deleteRecurring(ruleId, &err));
+    }
+
+    void excelExport()
+    {
+        // Workbook basics
+        QCOMPARE(xlsx::columnName(0), QStringLiteral("A"));
+        QCOMPARE(xlsx::columnName(25), QStringLiteral("Z"));
+        QCOMPARE(xlsx::columnName(26), QStringLiteral("AA"));
+        QCOMPARE(xlsx::sanitizeSheetName(QStringLiteral("Income/Expenses [2026]: a*very?long name over 31")), QStringLiteral("IncomeExpenses 2026 averylong n"));
+
+        const QByteArray annual = reports::toXlsx(reports::annual(store(), 2026), QStringLiteral("Biz & <Co>"));
+        QVERIFY(annual.startsWith("PK\x03\x04"));
+        QVERIFY(annual.contains("xl/worksheets/sheet3.xml")); // Summary, Monthly totals, Category by month
+        QVERIFY(annual.contains("[Content_Types].xml"));
+        const QByteArray monthly = reports::toXlsx(reports::monthly(store(), 2026, 3), QStringLiteral("Biz"));
+        QVERIFY(monthly.contains("xl/worksheets/sheet4.xml")); // Summary + 3 tables
+
+        // Typed values back the display text
+        const auto m = reports::monthly(store(), 2026, 3);
+        QCOMPARE(m.tables[1].values.size(), m.tables[1].rows.size());
+        QCOMPARE(m.stats[0].raw.kind, reports::Value::Kind::Money);
+        QCOMPARE(reports::display(reports::Value::change(-4.04)), QStringLiteral("▼ 4.0%"));
+        QCOMPARE(reports::display(reports::Value::moneyDash(0)), QStringLiteral("–"));
+
+        // Transactions export by extension
+        QTemporaryDir dir;
+        QString err;
+        QVERIFY(backup::exportTransactions(store(), store().transactions(), dir.filePath(QStringLiteral("t.xlsx")), QStringLiteral("All"), &err));
+        QVERIFY(backup::exportTransactions(store(), store().transactions(), dir.filePath(QStringLiteral("t.csv")), QStringLiteral("All"), &err));
+        QFile x(dir.filePath(QStringLiteral("t.xlsx")));
+        QVERIFY(x.open(QIODevice::ReadOnly));
+        QVERIFY(x.read(4) == QByteArray("PK\x03\x04"));
+        QFile c(dir.filePath(QStringLiteral("t.csv")));
+        QVERIFY(c.open(QIODevice::ReadOnly));
+        QVERIFY(c.readAll().contains("Date,Type,Category"));
     }
 
     void sampleData()

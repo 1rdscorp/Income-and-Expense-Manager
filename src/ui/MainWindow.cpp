@@ -209,7 +209,11 @@ void MainWindow::buildMenus()
         showPage(Backup);
         m_backup->chooseRestoreFile();
     });
-    file->addAction(QStringLiteral("&Export transactions (CSV)…"), this, [this]() { m_backup->exportCsv(); });
+    file->addAction(QStringLiteral("&Export transactions (Excel / CSV)…"), this, [this]() { m_backup->exportCsv(); });
+    file->addAction(QStringLiteral("Export current &report to Excel…"), this, [this]() {
+        showPage(Reports);
+        QMetaObject::invokeMethod(m_reports, "exportExcel");
+    });
     file->addSeparator();
     a = file->addAction(QStringLiteral("E&xit"), this, &QWidget::close);
     a->setShortcut(QKeySequence::Quit);

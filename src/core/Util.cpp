@@ -37,6 +37,7 @@ void setCurrency(const QString &code)
 
 QString currencyCode() { return g_code; }
 QString currencySymbol() { return g_symbol; }
+int currencyDecimals() { return g_decimals; }
 
 QString money(qint64 cents)
 {

@@ -6,7 +6,10 @@
 #include "core/Store.h"
 #include "core/Util.h"
 
+#include <QDesktopServices>
+#include <QDir>
 #include <QFile>
+#include <QUrl>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -97,12 +100,16 @@ ReportsPage::ReportsPage(QWidget *parent)
     bar->setSpacing(10);
     m_tab = new SegmentedControl({{QStringLiteral("monthly"), QStringLiteral("Monthly")}, {QStringLiteral("annual"), QStringLiteral("Annual")}, {QStringLiteral("yoy"), QStringLiteral("Year over year")}});
     m_period = new PeriodNav;
-    auto *csv = ui::button(QStringLiteral("Export CSV"), QStringLiteral("download"));
+    auto *excel = ui::button(QStringLiteral("Export to Excel"), QStringLiteral("download"), QStringLiteral("primary"));
+    excel->setToolTip(QStringLiteral("Save this report as an Excel workbook (.xlsx)"));
+    auto *csv = ui::button(QStringLiteral("CSV"), QStringLiteral("download"));
+    csv->setToolTip(QStringLiteral("Save this report as a CSV file"));
     auto *pdf = ui::button(QStringLiteral("Save as PDF"), QStringLiteral("pdf"));
     auto *prn = ui::button(QStringLiteral("Print…"), QStringLiteral("print"));
     bar->addWidget(m_tab);
     bar->addWidget(m_period);
     bar->addStretch(1);
+    bar->addWidget(excel);
     bar->addWidget(csv);
     bar->addWidget(pdf);
     bar->addWidget(prn);
@@ -118,6 +125,7 @@ ReportsPage::ReportsPage(QWidget *parent)
         else m_year += d;
         refresh();
     });
+    connect(excel, &QPushButton::clicked, this, &ReportsPage::exportExcel);
     connect(csv, &QPushButton::clicked, this, &ReportsPage::exportCsv);
     connect(pdf, &QPushButton::clicked, this, &ReportsPage::exportPdf);
     connect(prn, &QPushButton::clicked, this, &ReportsPage::print);
@@ -185,6 +193,34 @@ void ReportsPage::refresh()
             m_content->addWidget(tableCard(t));
         }
     }
+}
+
+QString ReportsPage::baseFileName() const
+{
+    return QStringLiteral("%1-%2-report-%3").arg(util::slug(Store::instance().settings().businessName), m_report.kind, util::slug(m_report.period));
+}
+
+void ReportsPage::exportExcel()
+{
+    const QString path = ui::askExportPath(this, QStringLiteral("Export report to Excel"), baseFileName());
+    if (path.isEmpty()) return;
+    QString err;
+    bool ok;
+    if (path.endsWith(QLatin1String(".csv"), Qt::CaseInsensitive)) {
+        QFile f(path);
+        ok = f.open(QIODevice::WriteOnly) && f.write(util::toCsv(m_report.csv).toUtf8()) >= 0;
+        err = f.errorString();
+    } else {
+        ok = reports::saveXlsx(m_report, Store::instance().settings().businessName, path, &err);
+    }
+    if (!ok) {
+        QMessageBox::warning(this, QStringLiteral("Export failed"), err);
+        return;
+    }
+    const auto r = QMessageBox::information(this, QStringLiteral("Report exported"),
+                                            QStringLiteral("Saved to:\n%1").arg(QDir::toNativeSeparators(path)),
+                                            QMessageBox::Open | QMessageBox::Ok, QMessageBox::Ok);
+    if (r == QMessageBox::Open) QDesktopServices::openUrl(QUrl::fromLocalFile(path));
 }
 
 void ReportsPage::exportCsv()

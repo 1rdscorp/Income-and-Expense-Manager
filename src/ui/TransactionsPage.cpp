@@ -1,6 +1,9 @@
 #include "TransactionsPage.h"
 
 #include "ReceiptViewer.h"
+#include "RecurringDialog.h"
+#include "TransactionDialog.h"
+#include "core/Recurrence.h"
 #include "Theme.h"
 #include "Widgets.h"
 #include "core/Backup.h"
@@ -53,8 +56,8 @@ TransactionsPage::TransactionsPage(QWidget *parent)
     m_search->setClearButtonEnabled(true);
     m_search->setMinimumWidth(220);
     m_search->addAction(Theme::icon(QStringLiteral("search")), QLineEdit::LeadingPosition);
-    auto *csv = ui::button(QStringLiteral("Export CSV"), QStringLiteral("download"));
-    csv->setToolTip(QStringLiteral("Export the filtered list as CSV"));
+    auto *csv = ui::button(QStringLiteral("Export to Excel"), QStringLiteral("download"));
+    csv->setToolTip(QStringLiteral("Export the filtered list to Excel (.xlsx) or CSV"));
     bar->addWidget(m_mode);
     bar->addWidget(m_period);
     bar->addStretch(1);
@@ -134,15 +137,18 @@ TransactionsPage::TransactionsPage(QWidget *parent)
     connect(csv, &QPushButton::clicked, this, [this]() {
         const auto list = filtered();
         if (list.isEmpty()) {
-            QMessageBox::information(this, QStringLiteral("Export CSV"), QStringLiteral("There are no transactions to export."));
+            QMessageBox::information(this, QStringLiteral("Export"), QStringLiteral("There are no transactions to export."));
             return;
         }
-        const QString def = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + QStringLiteral("/transactions.csv");
-        const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export transactions"), def, QStringLiteral("CSV files (*.csv)"));
+        const QString period = m_mode->value() == QLatin1String("month") ? util::monthLabel(m_month.year(), m_month.month())
+                               : m_mode->value() == QLatin1String("year") ? QString::number(m_year)
+                                                                          : QStringLiteral("All time");
+        const QString path = ui::askExportPath(this, QStringLiteral("Export transactions"),
+                                               QStringLiteral("%1-transactions-%2").arg(util::slug(Store::instance().settings().businessName), util::slug(period)));
         if (path.isEmpty()) return;
-        QFile f(path);
-        if (!f.open(QIODevice::WriteOnly) || f.write(backup::transactionsCsv(Store::instance(), list).toUtf8()) < 0)
-            QMessageBox::warning(this, QStringLiteral("Export failed"), f.errorString());
+        QString err;
+        if (!backup::exportTransactions(Store::instance(), list, path, QStringLiteral("Transactions · %1").arg(period), &err))
+            QMessageBox::warning(this, QStringLiteral("Export failed"), err);
     });
 }
 
@@ -309,6 +315,22 @@ void TransactionsPage::deleteSelected()
     if (!Store::instance().deleteTransactions(ids, &err)) QMessageBox::warning(this, QStringLiteral("Delete failed"), err);
 }
 
+void TransactionsPage::stopRepeating(const QString &ruleId)
+{
+    const Recurring *rule = Store::instance().recurringRule(ruleId);
+    if (!rule) return;
+    const int n = Store::instance().recurringPostedCount(ruleId);
+    if (QMessageBox::question(this, QStringLiteral("Stop repeating"),
+                              QStringLiteral("Stop the recurring “%1” (%2)?\n\nNo more payments will be recorded automatically. "
+                                             "The %3 payment(s) already recorded are kept.")
+                                  .arg(rule->title(), recurrence::describe(*rule).toLower())
+                                  .arg(n))
+        != QMessageBox::Yes)
+        return;
+    QString err;
+    if (!Store::instance().deleteRecurring(ruleId, &err)) QMessageBox::warning(this, QStringLiteral("Stop repeating"), err);
+}
+
 void TransactionsPage::showContextMenu(const QPoint &pos)
 {
     QTreeWidgetItem *item = m_tree->itemAt(pos);
@@ -326,6 +348,30 @@ void TransactionsPage::showContextMenu(const QPoint &pos)
             QMenu *rm = menu.addMenu(Theme::icon(QStringLiteral("clip")), QStringLiteral("View receipt"));
             for (const auto &r : Store::instance().receiptsFor(id))
                 rm->addAction(r.name, this, [this, r]() { ReceiptViewer::display(this, r); });
+        }
+        menu.addSeparator();
+        const Transaction *tx = Store::instance().transaction(id);
+        const Recurring *rule = tx ? Store::instance().recurringRule(tx->recurringId) : nullptr;
+        const QIcon repeatIcon = Theme::icon(QStringLiteral("repeat"), Theme::c().accent);
+        if (rule) {
+            const QString ruleId = rule->id;
+            menu.addAction(repeatIcon, QStringLiteral("Edit recurring series…"), this, [this, ruleId]() {
+                if (const Recurring *r = Store::instance().recurringRule(ruleId)) {
+                    RecurringDialog dlg(this);
+                    dlg.setRule(*r);
+                    dlg.exec();
+                }
+            });
+            menu.addAction(Theme::icon(QStringLiteral("x")), QStringLiteral("Stop repeating"), this, [this, ruleId]() { stopRepeating(ruleId); });
+        } else if (tx) {
+            menu.addAction(repeatIcon, QStringLiteral("Make recurring…"), this, [this, id]() {
+                const Transaction *t = Store::instance().transaction(id);
+                if (!t) return;
+                TransactionDialog dlg(this);
+                dlg.setTransaction(*t);
+                dlg.setRepeatChecked(true);
+                dlg.exec();
+            });
         }
         menu.addSeparator();
         const int n = selectedIds().size();

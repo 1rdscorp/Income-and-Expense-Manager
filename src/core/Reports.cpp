@@ -1,19 +1,58 @@
 #include "Reports.h"
 #include "Store.h"
 #include "Util.h"
+#include "Xlsx.h"
 
 #include <QDateTime>
 #include <QLocale>
 #include <QMap>
+#include <QSaveFile>
 #include <array>
 #include <algorithm>
+#include <cmath>
 
 namespace reports {
 
 using util::amountPlain;
 using util::money;
 
+QString display(const Value &v)
+{
+    switch (v.kind) {
+    case Value::Kind::Text: return v.text;
+    case Value::Kind::Money: return util::signedMoney(v.cents);
+    case Value::Kind::MoneyDash: return v.cents ? util::signedMoney(v.cents) : QStringLiteral("–");
+    case Value::Kind::Percent: return QLocale().toString(v.number, 'f', 1) + QLatin1Char('%');
+    case Value::Kind::Change:
+        return QStringLiteral("%1 %2%").arg(v.number >= 0 ? QStringLiteral("▲") : QStringLiteral("▼"), QLocale().toString(std::fabs(v.number), 'f', 1));
+    case Value::Kind::Count: return QString::number(static_cast<qint64>(v.number));
+    case Value::Kind::Date: return util::fmtDateLong(v.date);
+    default: return QString();
+    }
+}
+
+void Table::addRow(const QVector<Value> &cells, RowKind kind)
+{
+    QStringList text;
+    for (const Value &v : cells) text << display(v);
+    rows << text;
+    values << cells;
+    kinds << kind;
+}
+
 namespace {
+
+Stat stat(const QString &label, const Value &raw, const QString &meta = QString(), const QString &swatch = QString())
+{
+    Stat s;
+    s.label = label;
+    s.raw = raw;
+    s.value = display(raw);
+    s.meta = meta;
+    s.swatch = swatch;
+    s.negative = (raw.kind == Value::Kind::Money || raw.kind == Value::Kind::MoneyDash) && raw.cents < 0;
+    return s;
+}
 
 struct CatRow {
     Category c;
@@ -54,19 +93,16 @@ Table categoryTable(const QString &title, const QVector<CatRow> &rows, qint64 gr
     if (rows.isEmpty()) return t;
     int count = 0;
     for (const auto &r : rows) {
-        QStringList cells{catLabel(r.c), QString::number(r.v.count), money(r.v.total), util::pctText(r.v.total, grand)};
+        QVector<Value> cells{Value::str(catLabel(r.c)), Value::count(r.v.count), Value::money(r.v.total), Value::percent(util::pct(r.v.total, grand))};
         if (showBudget) {
-            cells << (r.c.budget ? money(r.c.budget) : QStringLiteral("—"))
-                  << (r.c.budget ? util::signedMoney(r.c.budget - r.v.total) : QStringLiteral("—"));
+            cells << (r.c.budget ? Value::money(r.c.budget) : Value::dash()) << (r.c.budget ? Value::money(r.c.budget - r.v.total) : Value::dash());
         }
-        t.rows << cells;
-        t.kinds << RowKind::Normal;
+        t.addRow(cells);
         count += r.v.count;
     }
-    QStringList total{QStringLiteral("Total"), QString::number(count), money(grand), QStringLiteral("100%")};
-    if (showBudget) total << QString() << QString();
-    t.rows << total;
-    t.kinds << RowKind::Total;
+    QVector<Value> total{Value::str(QStringLiteral("Total")), Value::count(count), Value::money(grand), Value::percent(100)};
+    if (showBudget) total << Value::empty() << Value::empty();
+    t.addRow(total, RowKind::Total);
     return t;
 }
 
@@ -77,9 +113,9 @@ QString marginText(const Totals &t)
 
 void addSummaryStats(Report &r, const Totals &t)
 {
-    r.stats.push_back({QStringLiteral("Total income"), money(t.income), QString(), QStringLiteral("income"), false});
-    r.stats.push_back({QStringLiteral("Total expenses"), money(t.expense), QString(), QStringLiteral("expense"), false});
-    r.stats.push_back({QStringLiteral("Net profit"), util::signedMoney(t.net()), marginText(t), QString(), t.net() < 0});
+    r.stats.push_back(stat(QStringLiteral("Total income"), Value::money(t.income), QString(), QStringLiteral("income")));
+    r.stats.push_back(stat(QStringLiteral("Total expenses"), Value::money(t.expense), QString(), QStringLiteral("expense")));
+    r.stats.push_back(stat(QStringLiteral("Net profit"), Value::money(t.net()), marginText(t)));
 }
 
 } // namespace
@@ -99,8 +135,7 @@ Report monthly(const Store &store, int year, int month)
     if (first.year() == today.year() && first.month() == today.month()) elapsed = today.day();
     else if (first < today) elapsed = first.daysInMonth();
     addSummaryStats(r, t);
-    r.stats.push_back({QStringLiteral("Avg. daily spending"), money(elapsed ? t.expense / elapsed : 0),
-                       QStringLiteral("%1 transactions").arg(t.count), QString(), false});
+    r.stats.push_back(stat(QStringLiteral("Avg. daily spending"), Value::money(elapsed ? t.expense / elapsed : 0), QStringLiteral("%1 transactions").arg(t.count)));
 
     const auto inc = categoryRows(store, txs, TxType::Income);
     const auto exp = categoryRows(store, txs, TxType::Expense);
@@ -121,14 +156,11 @@ Report monthly(const Store &store, int year, int month)
     daily.headers = {QStringLiteral("Date"), QStringLiteral("Transactions"), QStringLiteral("Income"), QStringLiteral("Expenses"), QStringLiteral("Net")};
     daily.numericColumns = {1, 2, 3, 4};
     daily.emptyText = QStringLiteral("No transactions this month.");
-    for (auto it = days.begin(); it != days.end(); ++it) {
-        daily.rows << QStringList{util::fmtDateLong(it.key()), QString::number(it->count), money(it->income), money(it->expense), util::signedMoney(it->net())};
-        daily.kinds << RowKind::Normal;
-    }
-    if (!days.isEmpty()) {
-        daily.rows << QStringList{QStringLiteral("Total"), QString::number(t.count), money(t.income), money(t.expense), util::signedMoney(t.net())};
-        daily.kinds << RowKind::Total;
-    }
+    for (auto it = days.begin(); it != days.end(); ++it)
+        daily.addRow({Value::day(it.key()), Value::count(it->count), Value::money(it->income), Value::money(it->expense), Value::money(it->net())});
+    if (!days.isEmpty())
+        daily.addRow({Value::str(QStringLiteral("Total")), Value::count(t.count), Value::money(t.income), Value::money(t.expense), Value::money(t.net())},
+                     RowKind::Total);
     r.tables << daily;
 
     // CSV
@@ -157,8 +189,8 @@ Report annual(const Store &store, int year)
     for (const auto &m : series)
         if (m.income || m.expense) ++active;
     addSummaryStats(r, t);
-    r.stats.push_back({QStringLiteral("Avg. monthly expenses"), money(active ? t.expense / active : 0),
-                       QStringLiteral("over %1 active month%2").arg(active).arg(active == 1 ? QString() : QStringLiteral("s")), QString(), false});
+    r.stats.push_back(stat(QStringLiteral("Avg. monthly expenses"), Value::money(active ? t.expense / active : 0),
+                           QStringLiteral("over %1 active month%2").arg(active).arg(active == 1 ? QString() : QStringLiteral("s"))));
 
     r.chart.valid = true;
     r.chart.title = QStringLiteral("Monthly totals · %1").arg(year);
@@ -189,7 +221,6 @@ Report annual(const Store &store, int year)
     };
     const auto inc = matrix(TxType::Income);
     const auto exp = matrix(TxType::Expense);
-    auto cell = [](qint64 v) { return v ? money(v) : QStringLiteral("–"); };
 
     Table m;
     m.title = QStringLiteral("Category by month · %1").arg(year);
@@ -203,30 +234,26 @@ Report annual(const Store &store, int year)
     m.emptyText = QStringLiteral("No transactions this year.");
     if (!txs.isEmpty()) {
         auto section = [&](const QString &title, const QVector<MRow> &rows, bool income) {
-            QStringList s{title};
-            for (int i = 0; i < 13; ++i) s << QString();
-            m.rows << s;
-            m.kinds << RowKind::Section;
+            QVector<Value> s{Value::str(title)};
+            for (int i = 0; i < 13; ++i) s << Value::empty();
+            m.addRow(s, RowKind::Section);
             for (const auto &row : rows) {
-                QStringList cells{catLabel(row.c)};
-                for (qint64 v : row.m) cells << cell(v);
-                cells << money(row.total);
-                m.rows << cells;
-                m.kinds << RowKind::Normal;
+                QVector<Value> cells{Value::str(catLabel(row.c))};
+                for (qint64 v : row.m) cells << Value::moneyDash(v);
+                cells << Value::money(row.total);
+                m.addRow(cells);
             }
-            QStringList tot{QStringLiteral("Total %1").arg(title.toLower())};
-            for (const auto &mm : series) tot << cell(income ? mm.income : mm.expense);
-            tot << money(income ? t.income : t.expense);
-            m.rows << tot;
-            m.kinds << RowKind::Total;
+            QVector<Value> tot{Value::str(QStringLiteral("Total %1").arg(title.toLower()))};
+            for (const auto &mm : series) tot << Value::moneyDash(income ? mm.income : mm.expense);
+            tot << Value::money(income ? t.income : t.expense);
+            m.addRow(tot, RowKind::Total);
         };
         section(QStringLiteral("Income"), inc, true);
         section(QStringLiteral("Expenses"), exp, false);
-        QStringList net{QStringLiteral("Net profit")};
-        for (const auto &mm : series) net << ((mm.income || mm.expense) ? util::signedMoney(mm.net()) : QStringLiteral("–"));
-        net << util::signedMoney(t.net());
-        m.rows << net;
-        m.kinds << RowKind::Net;
+        QVector<Value> net{Value::str(QStringLiteral("Net profit"))};
+        for (const auto &mm : series) net << Value::moneyDash(mm.net());
+        net << Value::money(t.net());
+        m.addRow(net, RowKind::Net);
     }
     r.tables << m;
 
@@ -282,10 +309,9 @@ Report yearOverYear(const Store &store)
         r.chart.income << d.t.income;
         r.chart.expense << d.t.expense;
     }
-    auto change = [](qint64 cur, qint64 prev) -> QString {
-        if (!prev) return QStringLiteral("—");
-        const double d = (static_cast<double>(cur - prev) / static_cast<double>(prev < 0 ? -prev : prev)) * 100.0;
-        return QStringLiteral("%1 %2%").arg(cur >= prev ? QStringLiteral("▲") : QStringLiteral("▼"), QLocale().toString(d < 0 ? -d : d, 'f', 1));
+    auto change = [](qint64 cur, qint64 prev) -> Value {
+        if (!prev) return Value::dash();
+        return Value::change(std::round((static_cast<double>(cur - prev) / static_cast<double>(prev < 0 ? -prev : prev)) * 1000.0) / 10.0);
     };
     Table t;
     t.title = QStringLiteral("Year over year");
@@ -295,11 +321,9 @@ Report yearOverYear(const Store &store)
     for (int i = data.size() - 1; i >= 0; --i) {
         const auto &d = data[i];
         const Y *prev = i > 0 && data[i - 1].y == d.y - 1 ? &data[i - 1] : nullptr;
-        t.rows << QStringList{QString::number(d.y), money(d.t.income), prev ? change(d.t.income, prev->t.income) : QStringLiteral("—"),
-                              money(d.t.expense), prev ? change(d.t.expense, prev->t.expense) : QStringLiteral("—"),
-                              util::signedMoney(d.t.net()), d.t.income ? util::pctText(d.t.net(), d.t.income) : QStringLiteral("—"),
-                              QString::number(d.t.count), d.top};
-        t.kinds << RowKind::Normal;
+        t.addRow({Value::str(QString::number(d.y)), Value::money(d.t.income), prev ? change(d.t.income, prev->t.income) : Value::dash(),
+                  Value::money(d.t.expense), prev ? change(d.t.expense, prev->t.expense) : Value::dash(), Value::money(d.t.net()),
+                  d.t.income ? Value::percent(util::pct(d.t.net(), d.t.income)) : Value::dash(), Value::count(d.t.count), Value::str(d.top)});
     }
     r.tables << t;
     r.csv << QStringList{QStringLiteral("%1 — Year over year").arg(store.settings().businessName)} << QStringList{}
@@ -366,6 +390,170 @@ QString toHtml(const Report &r, const QString &businessName, const QString &char
     }
     h += QStringLiteral("</body></html>");
     return h;
+}
+
+namespace {
+
+xlsx::Cell toCell(const Value &v, RowKind kind, bool firstColumn)
+{
+    xlsx::Cell c;
+    switch (v.kind) {
+    case Value::Kind::Text:
+        // "—" means "not applicable": leave the cell empty so sums and filters work
+        c = (v.text == QStringLiteral("—") || v.text == QStringLiteral("–")) ? xlsx::Cell::empty() : xlsx::Cell::str(v.text);
+        break;
+    case Value::Kind::Money: c = xlsx::Cell::money(v.cents, xlsx::Format::Money); break;
+    case Value::Kind::MoneyDash: c = xlsx::Cell::money(v.cents, xlsx::Format::MoneyDash); break;
+    case Value::Kind::Percent: c = xlsx::Cell::num(v.number / 100.0, xlsx::Format::Percent); break;
+    case Value::Kind::Change: c = xlsx::Cell::num(v.number / 100.0, xlsx::Format::Change); break;
+    case Value::Kind::Count: c = xlsx::Cell::num(v.number, xlsx::Format::Integer); break;
+    case Value::Kind::Date: c = xlsx::Cell::day(v.date); break;
+    default: c = xlsx::Cell::empty(); break;
+    }
+    switch (kind) {
+    case RowKind::Section: c.bold = true; c.fill = xlsx::Fill::Section; break;
+    case RowKind::Total: c.bold = true; c.fill = xlsx::Fill::Total; break;
+    case RowKind::Net: c.bold = true; c.fill = xlsx::Fill::Net; break;
+    default: break;
+    }
+    Q_UNUSED(firstColumn);
+    return c;
+}
+
+xlsx::Cell header(const QString &text)
+{
+    xlsx::Cell c = xlsx::Cell::str(text);
+    c.bold = true;
+    c.fill = xlsx::Fill::Header;
+    return c;
+}
+
+xlsx::Cell titleCell(const QString &text)
+{
+    xlsx::Cell c = xlsx::Cell::str(text);
+    c.title = true;
+    return c;
+}
+
+xlsx::Cell mutedCell(const QString &text)
+{
+    xlsx::Cell c = xlsx::Cell::str(text);
+    c.muted = true;
+    return c;
+}
+
+// Strip the emoji icon prefix from category labels for spreadsheets.
+QString plainLabel(const QString &s)
+{
+    const int i = s.indexOf(QStringLiteral("  "));
+    if (i > 0 && i <= 4) return s.mid(i + 2);
+    return s;
+}
+
+} // namespace
+
+QByteArray toXlsx(const Report &r, const QString &businessName)
+{
+    xlsx::Workbook wb(util::currencySymbol().trimmed(), util::currencyDecimals());
+    const QString generated = QStringLiteral("Generated %1 by Ledgerly").arg(QLocale().toString(QDateTime::currentDateTime(), QStringLiteral("d MMM yyyy, HH:mm")));
+
+    // Summary
+    xlsx::Sheet &sum = wb.addSheet(QStringLiteral("Summary"));
+    sum.addRow({titleCell(businessName)});
+    sum.addRow({xlsx::Cell::str(QStringLiteral("%1 — %2").arg(r.title, r.period))});
+    sum.addRow({mutedCell(generated)});
+    sum.addBlankRow();
+    if (!r.stats.isEmpty()) {
+        xlsx::Cell valueHead = header(QStringLiteral("Value"));
+        valueHead.align = xlsx::Align::Right;
+        sum.addRow({header(QStringLiteral("Measure")), valueHead, header(QStringLiteral("Note"))});
+        for (const Stat &st : r.stats) {
+            xlsx::Cell label = xlsx::Cell::str(st.label);
+            label.bold = true;
+            sum.addRow({label, toCell(st.raw, RowKind::Normal, false), mutedCell(st.meta)});
+        }
+    }
+    if (r.stats.isEmpty() && !r.tables.isEmpty()) sum.addRow({mutedCell(QStringLiteral("See the following sheets for details."))});
+    sum.columnWidths = {26, 18, 30};
+
+    // Chart data as a table (handy for building charts in Excel)
+    if (r.chart.valid && !r.chart.labels.isEmpty()) {
+        const bool byYear = r.kind == QLatin1String("yoy");
+        xlsx::Sheet &sh = wb.addSheet(byYear ? QStringLiteral("Totals by year") : QStringLiteral("Monthly totals"));
+        sh.addRow({titleCell(r.chart.title)});
+        sh.addBlankRow();
+        QVector<xlsx::Cell> th{header(byYear ? QStringLiteral("Year") : QStringLiteral("Month")), header(QStringLiteral("Income")),
+                               header(QStringLiteral("Expenses")), header(QStringLiteral("Net profit"))};
+        for (int c = 1; c < th.size(); ++c) th[c].align = xlsx::Align::Right;
+        sh.addRow(th);
+        sh.frozenRows = 3;
+        qint64 ti = 0, te = 0;
+        for (int i = 0; i < r.chart.labels.size(); ++i) {
+            const qint64 in = r.chart.income.value(i), ex = r.chart.expense.value(i);
+            ti += in;
+            te += ex;
+            xlsx::Cell label = byYear ? xlsx::Cell::num(r.chart.labels[i].toInt()) : xlsx::Cell::str(r.chart.fullLabels.value(i, r.chart.labels[i]));
+            label.align = xlsx::Align::Left;
+            sh.addRow({label, xlsx::Cell::money(in), xlsx::Cell::money(ex), xlsx::Cell::money(in - ex)});
+        }
+        if (!byYear) {
+            QVector<xlsx::Cell> tot{xlsx::Cell::str(QStringLiteral("Total")), xlsx::Cell::money(ti), xlsx::Cell::money(te), xlsx::Cell::money(ti - te)};
+            for (auto &c : tot) {
+                c.bold = true;
+                c.fill = xlsx::Fill::Total;
+            }
+            sh.addRow(tot);
+        }
+        sh.columnWidths = {18, 16, 16, 16};
+    }
+
+    // One sheet per table
+    for (const Table &t : r.tables) {
+        xlsx::Sheet &sh = wb.addSheet(t.title.section(QStringLiteral(" · "), 0, 0));
+        sh.addRow({titleCell(t.title)});
+        sh.addRow({mutedCell(t.subtitle.isEmpty() ? r.period : QStringLiteral("%1 · %2").arg(r.period, t.subtitle))});
+        if (t.values.isEmpty()) {
+            sh.addRow({mutedCell(t.emptyText)});
+            sh.columnWidths = {30};
+            continue;
+        }
+        QVector<xlsx::Cell> head;
+        for (int c = 0; c < t.headers.size(); ++c) {
+            xlsx::Cell hc = header(t.headers[c]);
+            if (t.numericColumns.contains(c)) hc.align = xlsx::Align::Right;
+            head << hc;
+        }
+        sh.addRow(head);
+        sh.frozenRows = 3;
+        for (int i = 0; i < t.values.size(); ++i) {
+            const RowKind kind = t.kinds.value(i, RowKind::Normal);
+            QVector<xlsx::Cell> cells;
+            for (int c = 0; c < t.values[i].size(); ++c) {
+                Value v = t.values[i][c];
+                if (c == 0 && v.kind == Value::Kind::Text) v.text = plainLabel(v.text);
+                cells << toCell(v, kind, c == 0);
+            }
+            sh.addRow(cells);
+        }
+        sh.autoSizeColumns(10, 40);
+        if (!sh.columnWidths.isEmpty()) sh.columnWidths[0] = std::max(sh.columnWidths[0], 28.0);
+    }
+    return wb.toBytes();
+}
+
+bool saveXlsx(const Report &r, const QString &businessName, const QString &path, QString *error)
+{
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) {
+        if (error) *error = f.errorString();
+        return false;
+    }
+    f.write(toXlsx(r, businessName));
+    if (!f.commit()) {
+        if (error) *error = f.errorString();
+        return false;
+    }
+    return true;
 }
 
 } // namespace reports

@@ -2,6 +2,9 @@
 #include "Theme.h"
 
 #include <QButtonGroup>
+#include <QDir>
+#include <QFileDialog>
+#include <QStandardPaths>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QPainter>
@@ -341,6 +344,20 @@ void fitTableHeight(QTableWidget *table)
     if (table->horizontalScrollBar()->isVisible() || table->horizontalHeader()->length() > table->viewport()->width())
         h += table->horizontalScrollBar()->sizeHint().height();
     table->setFixedHeight(h + 2 * table->frameWidth() + 2);
+}
+
+QString askExportPath(QWidget *parent, const QString &title, const QString &baseName, bool excelDefault)
+{
+    const QString excel = QStringLiteral("Excel workbook (*.xlsx)");
+    const QString csv = QStringLiteral("CSV file (*.csv)");
+    QString selected = excelDefault ? excel : csv;
+    const QString def = QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+                            .filePath(baseName + (excelDefault ? QStringLiteral(".xlsx") : QStringLiteral(".csv")));
+    QString path = QFileDialog::getSaveFileName(parent, title, def, excelDefault ? excel + QStringLiteral(";;") + csv : csv + QStringLiteral(";;") + excel, &selected);
+    if (path.isEmpty()) return path;
+    if (!path.endsWith(QLatin1String(".xlsx"), Qt::CaseInsensitive) && !path.endsWith(QLatin1String(".csv"), Qt::CaseInsensitive))
+        path += selected == csv ? QStringLiteral(".csv") : QStringLiteral(".xlsx");
+    return path;
 }
 
 QString colorSpan(const QString &text, const QColor &color, bool bold)

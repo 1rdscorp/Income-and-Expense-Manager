@@ -59,6 +59,10 @@ public:
     // Creates or updates a rule, then records any payments already due.
     bool saveRecurring(const Recurring &r, QString *error = nullptr, const QDate &today = QDate::currentDate());
     bool setRecurringActive(const QString &id, bool active, const QDate &today = QDate::currentDate());
+    // Turns an existing transaction into the first payment of a new recurring series.
+    // recordMissed: also record occurrences between the transaction's date and today.
+    bool makeRecurring(const QString &txId, Frequency frequency, bool recordMissed, QString *error = nullptr,
+                       const QDate &today = QDate::currentDate(), QString *ruleId = nullptr);
     // Deletes the rule; payments already recorded are kept.
     bool deleteRecurring(const QString &id, QString *error = nullptr);
     // Records every occurrence due on or before `today`. Returns the transactions created.

@@ -54,7 +54,7 @@ BackupPage::BackupPage(QWidget *parent)
     auto *row = new QHBoxLayout;
     auto *full = ui::button(QStringLiteral("Back up now"), QStringLiteral("download"), QStringLiteral("primary"));
     auto *lite = ui::button(QStringLiteral("Backup without receipts"), QStringLiteral("download"));
-    auto *csv = ui::button(QStringLiteral("Export all transactions (CSV)"), QStringLiteral("download"));
+    auto *csv = ui::button(QStringLiteral("Export all transactions (Excel / CSV)"), QStringLiteral("download"));
     row->addWidget(full);
     row->addWidget(lite);
     row->addWidget(csv);
@@ -210,16 +210,15 @@ void BackupPage::exportCsv()
 {
     Store &s = Store::instance();
     if (s.transactions().isEmpty()) {
-        QMessageBox::information(this, QStringLiteral("Export CSV"), QStringLiteral("There are no transactions to export."));
+        QMessageBox::information(this, QStringLiteral("Export"), QStringLiteral("There are no transactions to export."));
         return;
     }
-    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export all transactions"),
-                                                      QDir(docsDir()).filePath(QStringLiteral("%1-transactions-%2.csv").arg(util::slug(s.settings().businessName), QDate::currentDate().toString(Qt::ISODate))),
-                                                      QStringLiteral("CSV files (*.csv)"));
+    const QString path = ui::askExportPath(this, QStringLiteral("Export all transactions"),
+                                           QStringLiteral("%1-transactions-%2").arg(util::slug(s.settings().businessName), QDate::currentDate().toString(Qt::ISODate)));
     if (path.isEmpty()) return;
-    QFile f(path);
-    if (!f.open(QIODevice::WriteOnly) || f.write(backup::transactionsCsv(s, s.transactions()).toUtf8()) < 0)
-        QMessageBox::warning(this, QStringLiteral("Export failed"), f.errorString());
+    QString err;
+    if (!backup::exportTransactions(s, s.transactions(), path, QStringLiteral("All transactions"), &err))
+        QMessageBox::warning(this, QStringLiteral("Export failed"), err);
 }
 
 void BackupPage::chooseRestoreFile()

@@ -5,6 +5,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QFrame;
 class QDateEdit;
 class QLabel;
 class QLineEdit;
@@ -26,6 +27,9 @@ public:
     Outcome outcome() const { return m_outcome; }
     TxType savedType() const { return m_type; }
 
+    // Ticks "Repeat this transaction" (used by "Make recurring…" in the transactions list).
+    void setRepeatChecked(bool on);
+
     // Adds files as pending receipts (also used by drag & drop). Returns number added.
     int addFiles(const QStringList &paths);
 
@@ -44,6 +48,10 @@ private:
     void save(bool another);
     void remove();
     void loadFields(const Transaction &t);
+    void syncRepeat();
+    void syncSeries();
+    void stopRepeating();
+    QVector<QDate> missedDates() const;
 
     Outcome m_outcome = Cancelled;
     TxType m_type = TxType::Expense;
@@ -72,4 +80,6 @@ private:
     QComboBox *m_repeatFreq;
     QLabel *m_repeatHint;
     QLabel *m_seriesNote;
+    QCheckBox *m_recordMissed;
+    QFrame *m_seriesRow;
 };
